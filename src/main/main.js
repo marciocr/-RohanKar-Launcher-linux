@@ -9,11 +9,26 @@ const path   = require('path');
 const fs     = require('fs');
 const https  = require('https');
 const { execFile, spawn } = require('child_process');
+const { pathToFileURL } = require('url');
+const runners = require('./runners');
+
+const IS_WIN   = process.platform === 'win32';
+const IS_LINUX = process.platform === 'linux';
+
+// The AppImage runtime can't provide the SUID chrome-sandbox helper, and some
+// distros (e.g. Ubuntu 24.04+) block unprivileged user namespaces, so Chromium's
+// sandbox would abort on startup. The renderer only loads local files with
+// contextIsolation on, so running without it is the usual trade-off here.
+if (process.env.APPIMAGE) app.commandLine.appendSwitch('no-sandbox');
 
 // ─── Paths ───────────────────────────────────────────────────────────────────
 
 const USER_DATA        = app.getPath('userData');
-const DEFAULT_GAMES_DIR = path.join(USER_DATA, 'games');
+// On Linux keep games out of ~/.config — use ~/Games like Heroic/Lutris do.
+const DEFAULT_GAMES_DIR = IS_LINUX
+  ? path.join(app.getPath('home'), 'Games', 'RohanKar')
+  : path.join(USER_DATA, 'games');
+const PREFIXES_DIR     = path.join(USER_DATA, 'prefixes');
 const LEGACY_DB_PATH   = path.join(USER_DATA, 'library.json');
 const SETTINGS_PATH    = path.join(USER_DATA, 'settings.json');
 
@@ -22,6 +37,25 @@ const THUMB_CACHE_DIR  = path.join(USER_DATA, 'thumbcache');
 [DEFAULT_GAMES_DIR, THUMB_CACHE_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 });
+
+const GITHUB_REPO = 'marciocr/-RohanKar-Launcher-linux';
+
+// file:// URL for a local path — handles both C:\ and /home/… paths plus spaces.
+const toFileUrl = (p) => pathToFileURL(p).href;
+
+// ─── CLI: headless launch (used by Steam shortcuts) ───────────────────────────
+//
+//   rohankar-launcher --launch <identifier> [--exe <path>]
+//
+// Runs the game through the configured runner without opening the UI, waits
+// for it to exit (so Steam tracks the session), records playtime and quits.
+
+function getArgValue(flag) {
+  const i = process.argv.indexOf(flag);
+  return i !== -1 && i + 1 < process.argv.length ? process.argv[i + 1] : null;
+}
+const CLI_LAUNCH_ID  = getArgValue('--launch');
+const CLI_LAUNCH_EXE = getArgValue('--exe');
 
 // ─── SQLite ───────────────────────────────────────────────────────────────────
 
@@ -138,13 +172,20 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (CLI_LAUNCH_ID) return runHeadlessLaunch(CLI_LAUNCH_ID, CLI_LAUNCH_EXE);
   createWindow();
   setupAutoUpdater();
   // Validate installs on every launch — clears DB entries whose folders were deleted
   validateInstalls();
 });
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+app.on('window-all-closed', () => {
+  // In headless launch mode there is never a window — quitting is handled on game exit
+  if (CLI_LAUNCH_ID) return;
+  if (process.platform !== 'darwin') app.quit();
+});
+app.on('activate', () => {
+  if (!CLI_LAUNCH_ID && BrowserWindow.getAllWindows().length === 0) createWindow();
+});
 
 // ─── Window controls ─────────────────────────────────────────────────────────
 
@@ -163,7 +204,7 @@ ipcMain.handle('check-game-hero', (_, { installDir }) => {
   for (const name of candidates) {
     const heroPath = path.join(installDir, name);
     if (fs.existsSync(heroPath)) {
-      return 'file:///' + heroPath.replace(/\\/g, '/');
+      return toFileUrl(heroPath);
     }
   }
   return null;
@@ -293,7 +334,7 @@ ipcMain.handle('collections-remove-game', (_, { collectionId, identifier }) => {
 ipcMain.handle('get-thumb', async (_, { identifier }) => {
   const liveUrl   = `https://archive.org/services/img/${identifier}`;
   const cachePath = path.join(THUMB_CACHE_DIR, `${identifier}.jpg`);
-  const cacheUrl  = 'file:///' + cachePath.replace(/\\/g, '/');
+  const cacheUrl  = toFileUrl(cachePath);
 
   // Serve from cache if it already exists and looks like a real image (>1 KB)
   if (fs.existsSync(cachePath) && fs.statSync(cachePath).size > 1024) {
@@ -525,24 +566,33 @@ ipcMain.handle('extract-archive', async (_, { filePath, identifier, subFolder })
 
   if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
 
-  const ext    = filePath.toLowerCase();
-  const sevenZ = 'C:\\Program Files\\7-Zip\\7z.exe';
+  const ext = filePath.toLowerCase();
 
   const unblockAfterExtract = () => unblockDirectory(destDir);
 
-  if ((ext.endsWith('.zip') || ext.endsWith('.7z') || ext.endsWith('.rar')) && fs.existsSync(sevenZ)) {
-    return new Promise((resolve) => {
-      execFile(sevenZ, ['x', filePath, `-o${destDir}`, '-y'], async (err) => {
-        if (err) return resolve({ ok: false, error: err.message });
-        await unblockAfterExtract();
-        if (settings.deleteAfterInstall) {
-          fs.unlink(filePath, () => {
-            try { fs.rmdirSync(path.dirname(filePath)); } catch {}
-          });
-        }
-        resolve({ ok: true, installDir: destDir, parentInstallDir: parentDir });
-      });
-    });
+  const extractors = findExtractors(ext, filePath, destDir);
+  if (extractors.length) {
+    let lastErr = null;
+    for (const [cmd, args] of extractors) {
+      const err = await new Promise(res => execFile(cmd, args, { maxBuffer: 64 * 1024 * 1024 }, e => res(e)));
+      if (!err) {
+        lastErr = null;
+        break;
+      }
+      console.warn(`[extract] ${path.basename(cmd)} failed: ${err.message}`);
+      lastErr = err;
+    }
+    if (!lastErr) {
+      await unblockAfterExtract();
+      if (settings.deleteAfterInstall) {
+        fs.unlink(filePath, () => {
+          try { fs.rmdirSync(path.dirname(filePath)); } catch {}
+        });
+      }
+      return { ok: true, installDir: destDir, parentInstallDir: parentDir };
+    }
+    if (!ext.endsWith('.zip')) return { ok: false, error: lastErr.message };
+    // .zip: fall through to extract-zip below
   }
 
   // fallback: extract-zip for .zip
@@ -562,8 +612,50 @@ ipcMain.handle('extract-archive', async (_, { filePath, identifier, subFolder })
     }
   }
 
+  if (ext.endsWith('.rar')) {
+    return { ok: false, error: 'RAR support needs 7-Zip or unrar. Install it with your package manager (e.g. "sudo dnf install 7zip" or "sudo apt install 7zip unrar").' };
+  }
   return { ok: false, error: 'Unsupported archive format' };
 });
+
+// Path to the 7za binary bundled via the 7zip-bin package (handles .zip/.7z,
+// not .rar). Inside a packaged app it lives in app.asar.unpacked.
+function bundled7za() {
+  try {
+    const p = require('7zip-bin').path7za.replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep);
+    return fs.existsSync(p) ? p : null;
+  } catch { return null; }
+}
+
+// Ordered list of [cmd, args] that can extract this archive, best first.
+function findExtractors(ext, filePath, destDir) {
+  const list = [];
+  const sevenZipArgs = ['x', filePath, `-o${destDir}`, '-y'];
+  const isArchive = ext.endsWith('.zip') || ext.endsWith('.7z') || ext.endsWith('.rar');
+  if (!isArchive) return list;
+
+  if (IS_WIN) {
+    const sevenZ = 'C:\\Program Files\\7-Zip\\7z.exe';
+    if (fs.existsSync(sevenZ)) list.push([sevenZ, sevenZipArgs]);
+    return list;
+  }
+
+  // System 7-Zip (7zz = official 7-Zip, 7z/7za = p7zip) — supports RAR when the codec is installed
+  for (const bin of ['7zz', '7z', '7za']) {
+    const p = runners.which(bin);
+    if (p) list.push([p, sevenZipArgs]);
+  }
+  if (ext.endsWith('.rar')) {
+    const unrar = runners.which('unrar');
+    if (unrar) list.push([unrar, ['x', '-o+', filePath, destDir + path.sep]]);
+    const bsdtar = runners.which('bsdtar');
+    if (bsdtar) list.push([bsdtar, ['-xf', filePath, '-C', destDir]]);
+  } else {
+    const b = bundled7za();
+    if (b) list.push([b, sevenZipArgs]);
+  }
+  return list;
+}
 
 // ─── Find executables in install dir ─────────────────────────────────────────
 //
@@ -627,7 +719,12 @@ ipcMain.handle('launch-game', (_, { identifier, exePath }) => {
     const unblockRoot = gameRow?.install_dir || path.dirname(exePath);
     await unblockDirectory(unblockRoot);
 
-    const start = Date.now();
+    if (!IS_WIN) {
+      const r = startGame(identifier, exePath);
+      if (!r.ok) return resolve(r);
+      r.child.on('exit', () => mainWindow?.webContents.send('game-exited', { identifier }));
+      return resolve({ ok: true, runner: r.runnerName });
+    }
 
     // shell.openPath uses Windows ShellExecute — handles UAC elevation prompts
     // correctly, unlike execFile which just gets EACCES on elevated exes.
@@ -641,6 +738,91 @@ ipcMain.handle('launch-game', (_, { identifier, exePath }) => {
       }
     });
   });
+});
+
+// ─── Linux: run through Proton / Wine and track playtime ─────────────────────
+
+const runningGames = new Map(); // identifier → ChildProcess
+
+function addPlaytime(identifier, secs) {
+  if (!db || secs <= 0) return;
+  db.prepare(`INSERT OR IGNORE INTO games (identifier, added_at) VALUES (?, ?)`).run(identifier, Date.now());
+  db.prepare('UPDATE games SET playtime_secs = COALESCE(playtime_secs, 0) + ? WHERE identifier = ?').run(secs, identifier);
+}
+
+// Spawns the game with the configured runner. Output goes to
+// <userData>/logs/<identifier>.log so Proton/Wine errors can be inspected.
+function startGame(identifier, exePath) {
+  if (runningGames.has(identifier)) return { ok: false, error: 'This game is already running.' };
+
+  const settings = loadSettings();
+  const safeId   = sanitizeFolderName(identifier);
+  const launch   = runners.buildLaunchCommand({
+    exePath,
+    prefixDir: path.join(PREFIXES_DIR, safeId),
+    runnerId:  settings.runner || 'auto',
+    useUmu:    settings.useUmu !== false,
+  });
+  if (launch.error) return { ok: false, error: launch.error };
+
+  const logDir = path.join(USER_DATA, 'logs');
+  fs.mkdirSync(logDir, { recursive: true });
+  const logFd = fs.openSync(path.join(logDir, `${safeId}.log`), 'w');
+  fs.writeSync(logFd, `[RohanKar] ${new Date().toISOString()} runner=${launch.runnerName}\n[RohanKar] ${launch.cmd} ${launch.args.join(' ')}\n\n`);
+  console.log(`[launch] ${identifier} via ${launch.runnerName}`);
+
+  let child;
+  try {
+    child = spawn(launch.cmd, launch.args, {
+      cwd:   launch.cwd,
+      env:   launch.env,
+      stdio: ['ignore', logFd, logFd],
+    });
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    fs.closeSync(logFd);
+  }
+
+  const start = Date.now();
+  runningGames.set(identifier, child);
+  child.on('error', (e) => {
+    console.error(`[launch] ${identifier} failed to start:`, e.message);
+    runningGames.delete(identifier);
+  });
+  child.on('exit', (code) => {
+    runningGames.delete(identifier);
+    const secs = Math.round((Date.now() - start) / 1000);
+    addPlaytime(identifier, secs);
+    console.log(`[launch] ${identifier} exited (code ${code}) after ${secs}s`);
+  });
+  return { ok: true, child, runnerName: launch.runnerName };
+}
+
+function runHeadlessLaunch(identifier, exeArg) {
+  const row = db?.prepare('SELECT install_dir, exe_path FROM games WHERE identifier = ?').get(identifier);
+  let exePath = exeArg || row?.exe_path;
+  if (!exePath && row?.install_dir) exePath = findExesInDir(row.install_dir)[0];
+
+  const fail = (msg) => { dialog.showErrorBox('RohanKar Launcher', msg); app.quit(); };
+  if (!exePath || !fs.existsSync(exePath)) return fail(`Could not find the executable for "${identifier}". Is the game still installed?`);
+
+  const r = startGame(identifier, exePath);
+  if (!r.ok) return fail(r.error);
+  r.child.on('exit',  () => app.quit());
+  r.child.on('error', (e) => fail(`Failed to start game: ${e.message}`));
+}
+
+// Proton / Wine runners available on this system (for the Settings dropdown)
+ipcMain.handle('platform-info', () => {
+  const info = IS_WIN ? { runners: [], umuAvailable: false } : runners.listRunners();
+  return {
+    platform:        process.platform,
+    defaultGamesDir: DEFAULT_GAMES_DIR,
+    prefixesDir:     PREFIXES_DIR,
+    runners:         info.runners,
+    umuAvailable:    info.umuAvailable,
+  };
 });
 
 // ─── Open game location in Explorer ──────────────────────────────────────────
@@ -951,7 +1133,7 @@ function setupAutoUpdater() {
     console.log('[updater] Update available:', info.version);
 
     // Fetch release notes from GitHub API
-    const releaseUrl = `https://api.github.com/repos/Kilted-Kraken/-RohanKar-Launcher/releases/tags/v${info.version}`;
+    const releaseUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/v${info.version}`;
     const fetchNotes = () => new Promise((resolve) => {
       https.get(releaseUrl, {
         headers: {
@@ -1011,7 +1193,7 @@ function setupAutoUpdater() {
 // IPC: renderer asks to download update — always registered, opens GitHub releases page
 ipcMain.removeHandler('updater-install');
 ipcMain.handle('updater-install', () => {
-  shell.openExternal('https://github.com/Kilted-Kraken/-RohanKar-Launcher/releases/latest');
+  shell.openExternal(`https://github.com/${GITHUB_REPO}/releases/latest`);
 });
 
 // ─── Add to Steam ───────────────────────────────────────────────────────────
@@ -1046,7 +1228,28 @@ function findSteamPath() {
       if (fs.existsSync(c)) return c;
     }
   }
+  if (IS_LINUX) {
+    // Prefer the install that actually has user accounts (native, Flatpak or Snap)
+    const roots = runners.findSteamRoots();
+    return roots.find(r => getSteamUserIds(r).length) || roots[0] || null;
+  }
   return null;
+}
+
+// Linux: the shortcut launches this app headlessly (`--launch <id>`) so the
+// game goes through the launcher's Proton/Wine setup and playtime tracking.
+// Returns { exe, startDir, launchOptions } for the shortcuts.vdf entry.
+function linuxShortcutTarget(identifier, exePath) {
+  const quote = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
+  const launchArgs = `--launch ${quote(identifier)} --exe ${quote(exePath)}`;
+  if (process.env.APPIMAGE) {
+    return { exe: process.env.APPIMAGE, startDir: path.dirname(process.env.APPIMAGE), launchOptions: launchArgs };
+  }
+  if (app.isPackaged) {
+    return { exe: process.execPath, startDir: path.dirname(process.execPath), launchOptions: launchArgs };
+  }
+  // Dev mode: `electron <app dir> --launch …`
+  return { exe: process.execPath, startDir: app.getAppPath(), launchOptions: `${quote(app.getAppPath())} ${launchArgs}` };
 }
 
 function getSteamUserIds(steamPath) {
@@ -1216,7 +1419,7 @@ function generateNonSteamAppId() {
   return (rand | 0x80000000) >>> 0;
 }
 
-ipcMain.handle('add-to-steam', async (_, { appName, exePath, startDir, iconPath }) => {
+ipcMain.handle('add-to-steam', async (_, { identifier, appName, exePath, startDir, iconPath }) => {
   try {
     const steamPath = findSteamPath();
     if (!steamPath) return { ok: false, error: 'Steam installation not found.' };
@@ -1227,7 +1430,18 @@ ipcMain.handle('add-to-steam', async (_, { appName, exePath, startDir, iconPath 
     // Exe field is stored with surrounding quotes in the VDF — Steam requires this.
     // The appID CRC is computed from the quoted exe string + appName, matching
     // what Steam ROM Manager, SteamTinkerLaunch, and the ICE project all use.
-    const quotedExe = `"${exePath}"`;
+    let quotedExe       = `"${exePath}"`;
+    let shortcutStart   = startDir || path.dirname(exePath);
+    let launchOptions   = '';
+    let icon            = '';
+    if (IS_LINUX) {
+      const target  = linuxShortcutTarget(identifier, exePath);
+      quotedExe     = `"${target.exe}"`;
+      shortcutStart = target.startDir;
+      launchOptions = target.launchOptions;
+      const thumb   = path.join(THUMB_CACHE_DIR, `${identifier}.jpg`);
+      if (fs.existsSync(thumb)) icon = thumb;
+    }
     const appId     = generateNonSteamAppId();
     const updated = [];
     const skipped = [];
@@ -1251,7 +1465,10 @@ ipcMain.handle('add-to-steam', async (_, { appName, exePath, startDir, iconPath 
 
       // Check if already added (match by exe or appid)
       const normalizedExe = exePath.replace(/\\/g, '/').toLowerCase();
-      const alreadyExists = shortcuts.some(s => {
+      const alreadyExists = IS_LINUX
+        // Every Linux shortcut shares the launcher as Exe — compare the launch args instead
+        ? shortcuts.some(s => (s.LaunchOptions || '') === launchOptions)
+        : shortcuts.some(s => {
         const sExe = (s.Exe || s.exe || '').replace(/\\/g, '/').toLowerCase()
           .replace(/^"|"$/g, ''); // strip surrounding quotes for comparison
         return sExe === normalizedExe || s.appid === appId;
@@ -1273,15 +1490,15 @@ ipcMain.handle('add-to-steam', async (_, { appName, exePath, startDir, iconPath 
       // Exe: quoted path (Steam requires this for the launch command).
       // StartDir: bare path WITHOUT quotes (quotes here break Steam's launch on Windows).
       // Ensure StartDir has a trailing backslash — Steam writes it this way
-      const startDirSlashed = startDir.endsWith('\\') ? startDir : startDir + '\\';
+      const startDirSlashed = IS_WIN && !shortcutStart.endsWith('\\') ? shortcutStart + '\\' : shortcutStart;
       shortcuts.push({
         appid:              appId,
         appname:            appName,
         Exe:                quotedExe,
         StartDir:           startDirSlashed,
-        icon:               '',
+        icon:               icon,
         ShortcutPath:       '',
-        LaunchOptions:      '',
+        LaunchOptions:      launchOptions,
         IsHidden:           0,
         AllowDesktopConfig: 1,
         AllowOverlay:       1,

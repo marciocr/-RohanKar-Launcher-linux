@@ -148,6 +148,8 @@ const installedFirstCheck         = document.getElementById('setting-installed-f
 const showInstalledBadgeCheck     = document.getElementById('setting-show-installed-badge');
 const btnChooseDownload       = document.getElementById('btn-choose-download');
 const btnChooseInstall        = document.getElementById('btn-choose-install');
+const runnerSelect            = document.getElementById('setting-runner');
+const useUmuCheck             = document.getElementById('setting-use-umu');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -461,7 +463,20 @@ async function init() {
 
   document.getElementById('btn-save-notes').addEventListener('click', onSaveNotes);
   document.getElementById('btn-add-to-steam').addEventListener('click', onAddToSteam);
-  document.getElementById('btn-add-to-steam').addEventListener('click', onAddToSteam);
+
+  // Linux runs games as child processes, so playtime is recorded when they exit
+  window.electronAPI.onGameExited(async ({ identifier }) => {
+    library = await window.electronAPI.getLibrary();
+    if (selectedGame?.identifier === identifier) {
+      const secs = library[identifier]?.playtime_secs;
+      if (secs) {
+        detailPlaytime.textContent = formatPlaytimeLong(secs);
+        detailPlaytime.classList.remove('hidden');
+      }
+    }
+    renderLibraryGrid();
+    renderHomeStats();
+  });
 
   const initSettings = await window.electronAPI.getSettings();
   installedFirst     = !!initSettings.installedFirst;
@@ -470,7 +485,8 @@ async function init() {
 
   try {
     const heroesDir = await window.electronAPI.getHeroesPath();
-    window._heroBasePath = 'file:///' + heroesDir.replace(/\\/g, '/');
+    const fwd = heroesDir.replace(/\\/g, '/');
+    window._heroBasePath = 'file://' + (fwd.startsWith('/') ? '' : '/') + fwd;
   } catch {
     window._heroBasePath = null;
   }
@@ -651,6 +667,7 @@ async function openSettings() {
   deleteAfterInstallCheck.checked   = !!s.deleteAfterInstall;
   installedFirstCheck.checked       = !!s.installedFirst;
   showInstalledBadgeCheck.checked   = s.showInstalledBadge !== false;
+  await populateRunnerSettings(s);
   settingsModal.classList.remove('hidden');
 }
 
@@ -665,12 +682,41 @@ async function saveSettings() {
     deleteAfterInstall:  deleteAfterInstallCheck.checked,
     installedFirst:      installedFirstCheck.checked,
     showInstalledBadge:  showInstalledBadgeCheck.checked,
+    runner:              runnerSelect.value || 'auto',
+    useUmu:              useUmuCheck.checked,
   });
   installedFirst     = installedFirstCheck.checked;
   showInstalledBadge = showInstalledBadgeCheck.checked;
   applyInstalledBadgeSetting();
   renderLibraryGrid();
   closeSettings();
+}
+
+// Linux: fill the Proton/Wine dropdown with the runners detected on this system
+async function populateRunnerSettings(s) {
+  const info = await window.electronAPI.getPlatformInfo();
+  downloadPathInput.placeholder = `Default: ${info.defaultGamesDir}`;
+  installPathInput.placeholder  = `Default: ${info.defaultGamesDir}`;
+
+  const isLinux = info.platform === 'linux';
+  document.querySelectorAll('.settings-linux-only').forEach(el => el.classList.toggle('hidden', !isLinux));
+  if (!isLinux) return;
+
+  const saved = s.runner || 'auto';
+  runnerSelect.innerHTML = '';
+  const autoName = info.runners[0]?.name || (info.umuAvailable ? 'UMU-Proton' : 'none found');
+  runnerSelect.add(new Option(`Automatic (${autoName})`, 'auto'));
+  for (const r of info.runners) runnerSelect.add(new Option(r.name, r.id));
+  if (saved !== 'auto' && !info.runners.some(r => r.id === saved)) {
+    runnerSelect.add(new Option(`${saved.replace(/^proton:/, '').split('/').pop()} (missing)`, saved));
+  }
+  runnerSelect.value = saved;
+
+  useUmuCheck.checked  = s.useUmu !== false;
+  useUmuCheck.disabled = !info.umuAvailable;
+  document.getElementById('umu-status').textContent = info.umuAvailable
+    ? 'Runs Proton inside the Steam Linux Runtime (recommended).'
+    : 'umu-launcher not installed — Proton will run directly.';
 }
 
 function applyInstalledBadgeSetting() {
@@ -1841,8 +1887,9 @@ async function onAddToSteam() {
 
   try {
     // StartDir must be the folder containing the exe, not the root install dir
-    const startDir = picked.substring(0, picked.lastIndexOf('\\'));
+    const startDir = picked.substring(0, Math.max(picked.lastIndexOf('\\'), picked.lastIndexOf('/')));
     const result = await window.electronAPI.addToSteam({
+      identifier: selectedGame.identifier,
       appName:  getTitle(selectedGame),
       exePath:  picked,
       startDir: startDir,

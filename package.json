@@ -1,19 +1,21 @@
 {
   "name": "rohankar-launcher",
   "version": "1.4.1",
-  "description": "RohanKar Game Launcher",
+  "description": "RohanKar Game Launcher (Linux build with Proton support)",
   "author": "Kilted-Kraken",
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
     "build": "electron-builder",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "electron-builder install-app-deps",
+    "build:linux": "electron-builder --linux AppImage"
   },
   "devDependencies": {
     "electron": "latest",
     "electron-builder": "latest"
   },
   "dependencies": {
+    "7zip-bin": "^5.2.0",
     "axios": "^1.0.0",
     "better-sqlite3": "^12.6.2",
     "electron-updater": "^6.3.9",
@@ -24,7 +26,9 @@
     "productName": "RohanKar Launcher",
     "files": [
       "src/**/*",
-      "assets/**/*"
+      "assets/**/*",
+      "!node_modules/7zip-bin/{mac,win}/**",
+      "!node_modules/7zip-bin/linux/{arm,arm64,ia32}/**"
     ],
     "extraResources": [
       {
@@ -40,12 +44,32 @@
       "icon": "assets/icons/rk-logo.icns"
     },
     "linux": {
-      "icon": "assets/icons/rk-logo.png"
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icons/rk-logo.png",
+      "category": "Game",
+      "executableName": "rohankar-launcher",
+      "artifactName": "RohanKar-Launcher-${version}-${arch}.AppImage",
+      "synopsis": "Game launcher for the RohanKar archive.org collection",
+      "desktop": {
+        "entry": {
+          "Keywords": "games;launcher;proton;wine;"
+        }
+      }
     },
     "publish": {
       "provider": "github",
-      "owner": "Kilted-Kraken",
-      "repo": "-RohanKar-Launcher"
-    }
+      "owner": "marciocr",
+      "repo": "-RohanKar-Launcher-linux"
+    },
+    "asarUnpack": [
+      "node_modules/7zip-bin/linux/x64/**"
+    ]
   }
 }

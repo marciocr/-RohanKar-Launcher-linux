@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Launch
   launchGame:     (opts)  => ipcRenderer.invoke('launch-game',         opts),
+  onGameExited:   (cb)    => ipcRenderer.on('game-exited', (_, data) => cb(data)),
   openGameLocation: (opts)=> ipcRenderer.invoke('open-game-location',  opts),
   readReadme:     (opts)  => ipcRenderer.invoke('read-readme',         opts),
 
@@ -64,6 +65,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // App info
   getAppVersion:   () => ipcRenderer.invoke('app-version'),
+  getPlatformInfo: () => ipcRenderer.invoke('platform-info'),
   getHeroesPath:   () => ipcRenderer.invoke('heroes-path'),
   checkGameHero:   (opts) => ipcRenderer.invoke('check-game-hero', opts),
   openExternal:    (url) => ipcRenderer.send('open-external', url),
