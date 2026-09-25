@@ -1,6 +1,6 @@
 {
   "name": "rohankar-launcher",
-  "version": "1.4.2",
+  "version": "0.1.0",
   "description": "RohanKar Game Launcher (Linux build with Proton support)",
   "author": "Kilted-Kraken",
   "main": "src/main/main.js",

@@ -44,18 +44,19 @@ jobs:
       # ── Generate commit-based changelog ─────────────────────────────────────
       # Collects all commits since the previous tag and groups them into a
       # draft changelog. You (or Claude) can then edit this before publishing.
+      # The first release starts from FORK_BASE — the last upstream commit this
+      # project was forked from — so upstream history never shows up here.
       - name: Generate draft changelog
+        env:
+          FORK_BASE: e636e08
         run: |
           prev_tag=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          since="${prev_tag:-$FORK_BASE}"
 
-          if [ -n "$prev_tag" ]; then
-            commits=$(git log "$prev_tag..HEAD" --pretty=format:"- %s (%h)" --no-merges)
-          else
-            commits=$(git log --pretty=format:"- %s (%h)" --no-merges)
-          fi
+          commits=$(git log "$since..HEAD" --pretty=format:"- %s (%h)" --no-merges)
 
           cat > release_notes.md <<EOF
-          ## RohanKar Launcher ${GITHUB_REF_NAME} (Linux)
+          ## RohanKar Launcher Linux ${GITHUB_REF_NAME}
 
           > ✏️ **This is an auto-generated draft.** Edit the notes below before publishing.
 
@@ -64,7 +65,7 @@ jobs:
           ## What's New
           <!-- Claude will fill this in each release -->
 
-          ## Changes since ${prev_tag}
+          ## Changes${prev_tag:+ since ${prev_tag}}
 
           ${commits}
 
@@ -78,7 +79,7 @@ jobs:
         with:
           draft: true           # DRAFT — you review & publish manually
           prerelease: false
-          name: RohanKar Launcher ${{ github.ref_name }}
+          name: RohanKar Launcher Linux ${{ github.ref_name }}
           body_path: release_notes.md
           files: |
             dist/*.AppImage
