@@ -125,6 +125,16 @@ function detectProtonBuilds() {
     protonRank(a.name) - protonRank(b.name) ||
     b.name.localeCompare(a.name, undefined, { numeric: true })
   );
+
+  // Same build in several Steam libraries (e.g. "Proton - Experimental" on two
+  // drives) — add the library location so the Settings dropdown can tell them apart
+  const counts = {};
+  for (const b of builds) counts[b.name] = (counts[b.name] || 0) + 1;
+  for (const b of builds) {
+    if (counts[b.name] < 2) continue;
+    const lib = b.dir.split(path.sep + 'steamapps' + path.sep)[0];
+    b.name += ` (${lib.replace(HOME, '~')})`;
+  }
   return builds;
 }
 

@@ -15,12 +15,6 @@ const runners = require('./runners');
 const IS_WIN   = process.platform === 'win32';
 const IS_LINUX = process.platform === 'linux';
 
-// The AppImage runtime can't provide the SUID chrome-sandbox helper, and some
-// distros (e.g. Ubuntu 24.04+) block unprivileged user namespaces, so Chromium's
-// sandbox would abort on startup. The renderer only loads local files with
-// contextIsolation on, so running without it is the usual trade-off here.
-if (process.env.APPIMAGE) app.commandLine.appendSwitch('no-sandbox');
-
 // ─── Paths ───────────────────────────────────────────────────────────────────
 
 const USER_DATA        = app.getPath('userData');
@@ -1171,8 +1165,9 @@ function setupAutoUpdater() {
 
   autoUpdater.on('error', (err) => {
     const msg = err.message || '';
-    // 404 = no GitHub release published yet, not a real error worth surfacing
-    if (msg.includes('404')) {
+    // 404 / "No published versions" = no GitHub release published yet,
+    // not a real error worth surfacing
+    if (msg.includes('404') || /no published versions/i.test(msg)) {
       console.log('[updater] No published release found yet — skipping update check.');
       return;
     }
