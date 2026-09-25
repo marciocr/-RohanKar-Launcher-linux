@@ -1118,6 +1118,9 @@ function setupAutoUpdater() {
 
   autoUpdater.autoDownload         = false; // don't auto-download — GitHub releases don't report progress
   autoUpdater.allowDowngrade        = false;
+  // electron-updater's default logger dumps whole HTTP responses to the
+  // console; keep only warnings/errors and let our 'error' handler decide.
+  autoUpdater.logger = { info() {}, debug() {}, warn: console.warn, error() {} };
 
   autoUpdater.on('checking-for-update', () => {
     console.log('[updater] Checking for update…');
@@ -1165,9 +1168,9 @@ function setupAutoUpdater() {
 
   autoUpdater.on('error', (err) => {
     const msg = err.message || '';
-    // 404 / "No published versions" = no GitHub release published yet,
-    // not a real error worth surfacing
-    if (msg.includes('404') || /no published versions/i.test(msg)) {
+    // No GitHub release published yet (404 / 406 / "No published versions" /
+    // "Unable to find latest version") — not a real error worth surfacing
+    if (/\b40[46]\b|no published versions|unable to find latest version/i.test(msg)) {
       console.log('[updater] No published release found yet — skipping update check.');
       return;
     }
@@ -1180,7 +1183,8 @@ function setupAutoUpdater() {
 
   // Check after the window is ready so the user sees the UI first
   mainWindow?.once('ready-to-show', () => {
-    setTimeout(() => autoUpdater.checkForUpdates(), 3000);
+    // Failures are reported through the 'error' event above
+    setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 3000);
   });
 
 }  
