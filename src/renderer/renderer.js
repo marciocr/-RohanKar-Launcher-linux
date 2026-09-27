@@ -32,8 +32,42 @@ let activeFilter       = 'all';
 let activeCollection   = '';
 
 // Download queue: identifier → { identifier, title, percent, status }
-// status: 'downloading' | 'extracting' | 'done' | 'error'
+// status: 'queued' | 'downloading' | 'extracting' | 'done' | 'error'
 const downloadQueue = new Map();
+const isActiveDownload = (e) => e.status === 'queued' || e.status === 'downloading' || e.status === 'extracting';
+
+// Only `maxConcurrentDownloads` archives download at once (setting, default 1);
+// the rest wait as 'queued'. A slot is freed when the file finishes downloading,
+// so extraction of one game doesn't hold up the next download.
+let maxConcurrentDownloads = 1;
+let downloadSlotsInUse     = 0;
+const downloadWaiters      = []; // FIFO of { queueKey, resolve }
+
+function acquireDownloadSlot(queueKey) {
+  if (downloadSlotsInUse < maxConcurrentDownloads) {
+    downloadSlotsInUse++;
+    return Promise.resolve(true);
+  }
+  return new Promise(resolve => downloadWaiters.push({ queueKey, resolve }));
+}
+
+function releaseDownloadSlot() {
+  downloadSlotsInUse = Math.max(0, downloadSlotsInUse - 1);
+  pumpDownloadQueue();
+}
+
+function pumpDownloadQueue() {
+  while (downloadSlotsInUse < maxConcurrentDownloads && downloadWaiters.length) {
+    downloadSlotsInUse++;
+    downloadWaiters.shift().resolve(true);
+  }
+}
+
+// Cancelled while still waiting — drop it without ever taking a slot
+function dropQueuedDownload(queueKey) {
+  const i = downloadWaiters.findIndex(w => w.queueKey === queueKey);
+  if (i >= 0) downloadWaiters.splice(i, 1)[0].resolve(false);
+}
 
 // Download history: session-persistent record of all downloads
 // { identifier, title, status, percent, startedAt, finishedAt }
@@ -152,6 +186,7 @@ const runnerSelect            = document.getElementById('setting-runner');
 const useUmuCheck             = document.getElementById('setting-use-umu');
 const launchInTerminalCheck   = document.getElementById('setting-launch-in-terminal');
 const debugLoggingCheck       = document.getElementById('setting-debug-logging');
+const maxDownloadsSelect      = document.getElementById('setting-max-downloads');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -488,6 +523,7 @@ async function init() {
 
   const initSettings = await window.electronAPI.getSettings();
   installedFirst     = !!initSettings.installedFirst;
+  maxConcurrentDownloads = initSettings.maxConcurrentDownloads || 1;
   showInstalledBadge = initSettings.showInstalledBadge !== false; // default true
   applyInstalledBadgeSetting();
 
@@ -503,7 +539,7 @@ async function init() {
   document.getElementById('btn-close-downloads').addEventListener('click', closeDownloadsModal);
   document.getElementById('btn-clear-download-history').addEventListener('click', () => {
     // Remove only completed/errored entries
-    const keep = downloadHistory.filter(e => e.status === 'downloading' || e.status === 'extracting');
+    const keep = downloadHistory.filter(isActiveDownload);
     downloadHistory.length = 0;
     keep.forEach(e => downloadHistory.push(e));
     renderDownloadsModal();
@@ -678,6 +714,7 @@ async function openSettings() {
   showInstalledBadgeCheck.checked   = s.showInstalledBadge !== false;
   launchInTerminalCheck.checked     = !!s.launchInTerminal;
   debugLoggingCheck.checked         = !!s.debugLogging;
+  maxDownloadsSelect.value          = String(s.maxConcurrentDownloads || 1);
   await populateRunnerSettings(s);
   settingsModal.classList.remove('hidden');
 }
@@ -697,7 +734,10 @@ async function saveSettings() {
     useUmu:              useUmuCheck.checked,
     launchInTerminal:    launchInTerminalCheck.checked,
     debugLogging:        debugLoggingCheck.checked,
+    maxConcurrentDownloads: Number(maxDownloadsSelect.value) || 1,
   });
+  maxConcurrentDownloads = Number(maxDownloadsSelect.value) || 1;
+  pumpDownloadQueue();
   installedFirst     = installedFirstCheck.checked;
   showInstalledBadge = showInstalledBadgeCheck.checked;
   applyInstalledBadgeSetting();
@@ -990,18 +1030,27 @@ function updateDownloadsModalProgress(identifier, entry) {
   if (bar) bar.style.width = `${entry.percent ?? 0}%`;
   // Update meta text
   const meta = item.querySelector('.dm-meta');
-  if (meta && entry.status !== 'extracting') meta.textContent = `${entry.percent ?? 0}%`;
-  else if (meta && entry.status === 'extracting') meta.textContent = 'Extracting…';
+  if (meta) meta.textContent = activeDownloadMeta(entry);
   // Update status label
   const status = item.querySelector('.dm-status');
-  if (status) status.textContent = entry.status === 'extracting' ? 'Extracting' : `${entry.percent ?? 0}%`;
+  if (status) status.textContent = activeDownloadStatus(entry);
+}
+
+function activeDownloadMeta(entry) {
+  if (entry.status === 'queued')     return 'Waiting for another download to finish…';
+  if (entry.status === 'extracting') return 'Extracting…';
+  return `${entry.percent ?? 0}%`;
+}
+
+function activeDownloadStatus(entry) {
+  if (entry.status === 'queued')     return 'Queued';
+  if (entry.status === 'extracting') return 'Extracting';
+  return `${entry.percent ?? 0}%`;
 }
 
 function updateDownloadsButton() {
   const btn    = document.getElementById('btn-downloads');
-  const active = [...downloadQueue.values()].filter(
-    e => e.status === 'downloading' || e.status === 'extracting'
-  );
+  const active = [...downloadQueue.values()].filter(isActiveDownload);
   // Remove old badge
   btn.querySelector('.dl-badge')?.remove();
   if (active.length > 0) {
@@ -1029,9 +1078,7 @@ function renderDownloadsModal() {
   // ─ Active section ─
   const activeSection = document.getElementById('downloads-active-section');
   const activeList    = document.getElementById('downloads-active-list');
-  const active = [...downloadQueue.values()].filter(
-    e => e.status === 'downloading' || e.status === 'extracting'
-  );
+  const active = [...downloadQueue.values()].filter(isActiveDownload);
 
   if (active.length === 0) {
     activeSection.classList.add('hidden');
@@ -1047,7 +1094,7 @@ function renderDownloadsModal() {
   const historyList  = document.getElementById('downloads-history-list');
   const countEl      = document.getElementById('downloads-history-count');
   const history = downloadHistory.filter(
-    e => e.status !== 'downloading' && e.status !== 'extracting'
+    e => !isActiveDownload(e)
   );
 
   countEl.textContent = history.length ? `(${history.length})` : '';
@@ -1090,8 +1137,7 @@ function makeDmItem(entry, isActive) {
   meta.className = 'dm-meta';
 
   if (isActive) {
-    const statusText = entry.status === 'extracting' ? 'Extracting…' : `${entry.percent ?? 0}%`;
-    meta.textContent = statusText;
+    meta.textContent = activeDownloadMeta(entry);
   } else {
     const when = entry.finishedAt
       ? new Date(entry.finishedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -1117,7 +1163,7 @@ function makeDmItem(entry, isActive) {
   const status = document.createElement('span');
   status.className = 'dm-status';
   if (isActive) {
-    status.textContent = entry.status === 'extracting' ? 'Extracting' : `${entry.percent ?? 0}%`;
+    status.textContent = activeDownloadStatus(entry);
   } else {
     status.textContent = entry.status === 'done' ? 'Done' : 'Error';
   }
@@ -1138,6 +1184,7 @@ function makeDmItem(entry, isActive) {
       // Delete from queue FIRST — before the IPC round-trip — so the
       // onDownload async flow sees it's gone the moment downloadStart resolves
       downloadQueue.delete(id);
+      dropQueuedDownload(id);
       const hi = downloadHistory.findIndex(h => h.identifier === id);
       if (hi >= 0) {
         downloadHistory[hi].status     = 'error';
@@ -1567,22 +1614,34 @@ async function startSingleDownload(queueKey, title, file, parentId) {
   const encodedName = file.name.split('/').map(encodeURIComponent).join('/');
   const fileUrl     = `https://archive.org/download/${identifier}/${encodedName}`;
 
-  dqSet(queueKey, { identifier: queueKey, title, percent: 0, status: 'downloading', startedAt: Date.now() });
+  dqSet(queueKey, { identifier: queueKey, title, percent: 0, status: 'queued', startedAt: Date.now() });
 
   // Only show inline progress bar for single-game installs (not collection items)
   const isPrimary = !parentId;
+  const showInline = () => selectedGame?.identifier === queueKey;
   if (isPrimary) {
     btnDownload.disabled = true;
     progressWrap.classList.remove('hidden');
     progressBar.style.width  = '0%';
-    progressText.textContent = '0%';
+    progressText.textContent = 'Queued';
   }
 
-  const result = await window.electronAPI.downloadStart({
-    identifier: queueKey,
-    downloadUrl: fileUrl,
-    fileName:    file.name,
-  });
+  if (!await acquireDownloadSlot(queueKey)) return; // cancelled while queued
+  if (!downloadQueue.has(queueKey)) { releaseDownloadSlot(); return; }
+
+  dqSet(queueKey, { status: 'downloading' });
+  if (isPrimary && showInline()) progressText.textContent = '0%';
+
+  let result;
+  try {
+    result = await window.electronAPI.downloadStart({
+      identifier: queueKey,
+      downloadUrl: fileUrl,
+      fileName:    file.name,
+    });
+  } finally {
+    releaseDownloadSlot();
+  }
 
   if (!downloadQueue.has(queueKey)) {
     if (isPrimary) { progressWrap.classList.add('hidden'); refreshButtonStates(); }
@@ -1648,6 +1707,7 @@ async function onCancelDownload() {
   const identifier = selectedGame.identifier;
   // Delete from queue first so progress events can't re-insert it
   downloadQueue.delete(identifier);
+  dropQueuedDownload(identifier);
   const hi = downloadHistory.findIndex(h => h.identifier === identifier);
   if (hi >= 0) { downloadHistory[hi].status = 'error'; downloadHistory[hi].finishedAt = Date.now(); }
   renderDownloadQueue();
