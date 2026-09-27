@@ -1061,7 +1061,7 @@ function launchGame(identifier, exePath, title) {
     await unblockDirectory(unblockRoot);
 
     if (!IS_WIN) {
-      const r = startGame(identifier, exePath);
+      const r = await startGame(identifier, exePath);
       if (!r.ok) return resolve(r);
       markPlayed(identifier, title);
       hideWhilePlaying();
@@ -1128,8 +1128,19 @@ function addPlaytime(identifier, secs) {
 // <userData>/logs/<identifier>.log so Proton/Wine errors can be inspected.
 // With "Launch in terminal" enabled, the command is written to
 // <userData>/logs/<identifier>.sh and run inside a terminal window instead.
-function startGame(identifier, exePath) {
-  if (runningGames.has(identifier)) return { ok: false, error: 'This game is already running.' };
+const startingGames = new Set(); // importing .reg fixes, not spawned yet
+
+async function startGame(identifier, exePath) {
+  if (runningGames.has(identifier) || startingGames.has(identifier)) return { ok: false, error: 'This game is already running.' };
+  startingGames.add(identifier);
+  try {
+    return await spawnGame(identifier, exePath);
+  } finally {
+    startingGames.delete(identifier);
+  }
+}
+
+async function spawnGame(identifier, exePath) {
 
   const settings = loadSettings();
   const safeId   = sanitizeFolderName(identifier);
@@ -1169,6 +1180,7 @@ function startGame(identifier, exePath) {
       `[RohanKar] Proton debug log: ${path.join(LOG_DIR, 'steam-*.log')}\n`;
   }
   fs.writeFileSync(logPath, header + '\n');
+  await importRegFixes(identifier, exePath, launch, logPath);
   console.log(`[launch] ${identifier} via ${launch.runnerName}: ${launch.cmd} ${launch.args.join(' ')} (cwd ${launch.cwd})`);
 
   let cmd  = launch.cmd;
@@ -1285,7 +1297,57 @@ function findTerminal(script) {
   return null;
 }
 
-function runHeadlessLaunch(identifier, exeArg) {
+// Game archives often ship .reg files (install path, CD key…) that the
+// readme says to import by hand, and without which the game quits at once.
+// Each one is imported into the game's prefix with the game's own runner
+// before launch — once per distinct file content.
+async function importRegFixes(identifier, exePath, launch, logPath) {
+  if (IS_WIN || !/\.(exe|bat|msi|com)$/i.test(exePath)) return;
+  const row  = db?.prepare('SELECT install_dir FROM games WHERE identifier = ?').get(identifier);
+  const regs = findFilesByExt(row?.install_dir || path.dirname(exePath), '.reg', 3);
+  if (!regs.length) return;
+
+  const stateFile = path.join(PREFIXES_DIR, sanitizeFolderName(identifier), 'rohankar-reg-imports.json');
+  let state = {};
+  try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch {}
+
+  for (const reg of regs) {
+    const hash = require('crypto').createHash('sha1').update(fs.readFileSync(reg)).digest('hex');
+    if (state[hash]) continue;
+    // Z: maps to / in Wine and Proton prefixes
+    const winPath = 'Z:' + reg.replace(/\//g, '\\');
+    const args    = launch.args.flatMap(a => a === exePath ? ['regedit', '/S', winPath] : [a]);
+    fs.appendFileSync(logPath, `[RohanKar] importing registry file ${reg}\n`);
+    console.log(`[launch] ${identifier}: importing ${reg}`);
+    const fd   = fs.openSync(logPath, 'a');
+    const code = await new Promise(res => {
+      try {
+        const c = spawn(launch.cmd, args, { cwd: launch.cwd, env: launch.env, stdio: ['ignore', fd, fd] });
+        c.on('exit', res);
+        c.on('error', () => res(-1));
+      } catch { res(-1); }
+    });
+    fs.closeSync(fd);
+    fs.appendFileSync(logPath, `[RohanKar] regedit exited with code ${code}\n\n`);
+    if (code === 0) state[hash] = reg;
+  }
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
+function findFilesByExt(dir, ext, depth) {
+  const out = [];
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isFile() && e.name.toLowerCase().endsWith(ext)) out.push(full);
+    else if (e.isDirectory() && depth > 0) out.push(...findFilesByExt(full, ext, depth - 1));
+  }
+  return out;
+}
+
+async function runHeadlessLaunch(identifier, exeArg) {
   const row = db?.prepare('SELECT install_dir, exe_path FROM games WHERE identifier = ?').get(identifier);
   let exePath = exeArg || row?.exe_path;
   if (!exePath && row?.install_dir) exePath = findExesInDir(row.install_dir)[0];
@@ -1293,7 +1355,7 @@ function runHeadlessLaunch(identifier, exeArg) {
   const fail = (msg) => { dialog.showErrorBox('RohanKar Launcher', msg); app.quit(); };
   if (!exePath || !fs.existsSync(exePath)) return fail(`Could not find the executable for "${identifier}". Is the game still installed?`);
 
-  const r = startGame(identifier, exePath);
+  const r = await startGame(identifier, exePath);
   if (!r.ok) return fail(r.error);
   r.child.on('exit',  () => app.quit());
   r.child.on('error', (e) => fail(`Failed to start game: ${e.message}`));

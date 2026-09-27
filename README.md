@@ -89,6 +89,7 @@ Games from the archive are Windows builds, so the launcher runs them through a c
 If [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) is installed (`umu-run` on your `PATH`), Proton runs inside the Steam Linux Runtime, the same container Steam uses. This is the most compatible option. Without any Proton installed, umu downloads UMU-Proton on its own.
 
 - Each game gets its own prefix in `~/.config/RohanKar Launcher/prefixes/<game>/`, where your saves live.
+- Registry fixes (`.reg` files) shipped with a game are imported into its prefix automatically before the first launch, and again if they change.
 - Game output (Proton/Wine logs) is written to `~/.config/RohanKar Launcher/logs/<game>.log`.
 - Playtime is tracked automatically while the game runs.
 
