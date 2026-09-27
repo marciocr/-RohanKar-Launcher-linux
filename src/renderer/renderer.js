@@ -187,6 +187,10 @@ const useUmuCheck             = document.getElementById('setting-use-umu');
 const launchInTerminalCheck   = document.getElementById('setting-launch-in-terminal');
 const debugLoggingCheck       = document.getElementById('setting-debug-logging');
 const maxDownloadsSelect      = document.getElementById('setting-max-downloads');
+const trayIconCheck           = document.getElementById('setting-tray-icon');
+const closeToTrayCheck        = document.getElementById('setting-close-to-tray');
+const startMinimizedCheck     = document.getElementById('setting-start-minimized');
+const hideWhilePlayingCheck   = document.getElementById('setting-hide-while-playing');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -570,6 +574,7 @@ async function init() {
   });
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
   document.getElementById('btn-open-logs').addEventListener('click', () => window.electronAPI.openLog());
+  trayIconCheck.addEventListener('change', syncTraySettings);
 
   // Scan for pre-existing installs
   document.getElementById('btn-scan-games').addEventListener('click', onScanForGames);
@@ -715,8 +720,23 @@ async function openSettings() {
   launchInTerminalCheck.checked     = !!s.launchInTerminal;
   debugLoggingCheck.checked         = !!s.debugLogging;
   maxDownloadsSelect.value          = String(s.maxConcurrentDownloads || 1);
+  trayIconCheck.checked             = s.trayIcon !== false;
+  closeToTrayCheck.checked          = !!s.closeToTray;
+  startMinimizedCheck.checked       = !!s.startMinimized;
+  hideWhilePlayingCheck.checked     = !!s.hideWhilePlaying;
+  syncTraySettings();
   await populateRunnerSettings(s);
   settingsModal.classList.remove('hidden');
+}
+
+// Close-to-tray and start-minimized need the tray icon
+function syncTraySettings() {
+  const on = trayIconCheck.checked;
+  closeToTrayCheck.disabled    = !on;
+  startMinimizedCheck.disabled = !on;
+  hideWhilePlayingCheck.closest('.settings-row').querySelector('.settings-hint').textContent = on
+    ? 'Hides it to the tray; it comes back when the game exits.'
+    : 'Minimizes it; it comes back when the game exits.';
 }
 
 function closeSettings() {
@@ -735,6 +755,10 @@ async function saveSettings() {
     launchInTerminal:    launchInTerminalCheck.checked,
     debugLogging:        debugLoggingCheck.checked,
     maxConcurrentDownloads: Number(maxDownloadsSelect.value) || 1,
+    trayIcon:            trayIconCheck.checked,
+    closeToTray:         closeToTrayCheck.checked,
+    startMinimized:      startMinimizedCheck.checked,
+    hideWhilePlaying:    hideWhilePlayingCheck.checked,
   });
   maxConcurrentDownloads = Number(maxDownloadsSelect.value) || 1;
   pumpDownloadQueue();
@@ -1726,6 +1750,7 @@ async function onLaunch() {
   if (lib.exe_path) {
     const result = await window.electronAPI.launchGame({
       identifier: selectedGame.identifier,
+      title:      getTitle(selectedGame),
       exePath:    lib.exe_path,
     });
     if (!result.ok) alert('Failed to launch: ' + result.error);
@@ -1740,6 +1765,7 @@ async function onLaunch() {
   if (exePaths.length === 1) {
     const result = await window.electronAPI.launchGame({
       identifier: selectedGame.identifier,
+      title:      getTitle(selectedGame),
       exePath:    exePaths[0],
     });
     if (!result.ok) alert('Failed to launch: ' + result.error);
@@ -1749,6 +1775,7 @@ async function onLaunch() {
   if (!picked) return;
   const result = await window.electronAPI.launchGame({
     identifier: selectedGame.identifier,
+    title:      getTitle(selectedGame),
     exePath:    picked,
   });
   if (!result.ok) alert('Failed to launch: ' + result.error);

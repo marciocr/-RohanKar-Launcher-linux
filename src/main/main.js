@@ -4,7 +4,7 @@
  * Session 5: Auto-updater added (electron-updater + GitHub releases).
  */
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage } = require('electron');
 const path   = require('path');
 const fs     = require('fs');
 const https  = require('https');
@@ -51,11 +51,17 @@ function getArgValue(flag) {
 }
 const CLI_LAUNCH_ID  = getArgValue('--launch');
 const CLI_LAUNCH_EXE = getArgValue('--exe');
-const CLI_DEBUG      = process.argv.includes('--debug');
+const CLI_DEBUG      = process.argv.includes('--debug-log');
+
+// Only one launcher UI at a time — opening it again brings back the existing
+// window (e.g. when it is hidden in the tray). Headless --launch runs from
+// Steam shortcuts are independent and skip the lock.
+const IS_PRIMARY = !!CLI_LAUNCH_ID || app.requestSingleInstanceLock();
+if (!IS_PRIMARY) app.quit();
 
 // ─── Debug log ────────────────────────────────────────────────────────────────
 //
-// With "Debug logging" enabled in Settings (or --debug on the command line),
+// With "Debug logging" enabled in Settings (or --debug-log on the command line),
 // everything the main process prints is also appended to <userData>/logs/launcher.log.
 
 const LAUNCHER_LOG = path.join(LOG_DIR, 'launcher.log');
@@ -129,6 +135,8 @@ try {
     added_at:      'INTEGER',
     is_favorite:   'INTEGER DEFAULT 0',
     notes:         'TEXT',
+    title:         'TEXT',
+    last_played:   'INTEGER',
   };
   for (const [col, type] of Object.entries(needed)) {
     if (!existingCols.includes(col)) {
@@ -175,6 +183,7 @@ function loadSettings() {
 function saveSettings(data) {
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(data, null, 2));
   setDebug(data.debugLogging);
+  if (app.isReady()) updateTray();
 }
 
 // ─── Window ───────────────────────────────────────────────────────────────────
@@ -182,10 +191,13 @@ function saveSettings(data) {
 let mainWindow;
 
 function createWindow() {
+  const s = loadSettings();
   mainWindow = new BrowserWindow({
     width:  1280,
     height: 800,
     frame:  false,
+    show:   !(s.trayIcon !== false && s.startMinimized),
+    icon:   APP_ICON,
     webPreferences: {
       preload:          path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -193,12 +205,101 @@ function createWindow() {
     },
   });
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+
+  // "Close to tray": the window's close button hides it instead of quitting
+  mainWindow.on('close', (e) => {
+    if (isQuitting || !tray || !loadSettings().closeToTray) return;
+    e.preventDefault();
+    mainWindow.hide();
+  });
+  mainWindow.on('show', updateTray);
+  mainWindow.on('hide', updateTray);
+  mainWindow.on('closed', () => { mainWindow = null; updateTray(); });
+}
+
+// ─── Tray ─────────────────────────────────────────────────────────────────────
+
+const APP_ICON = path.join(__dirname, '../../assets/icons/rk-logo.png');
+let tray       = null;
+let isQuitting = false;
+let hiddenForGame = false; // window was hidden by "Hide while playing"
+
+app.on('before-quit', () => { isQuitting = true; });
+app.on('second-instance', () => showWindow());
+
+function showWindow() {
+  if (!mainWindow) createWindow();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function toggleWindow() {
+  if (mainWindow?.isVisible() && !mainWindow.isMinimized()) mainWindow.hide();
+  else showWindow();
+}
+
+// Creates, refreshes or removes the tray icon to match the settings.
+// Linux menus can't be rebuilt while open, so this runs whenever anything
+// shown in the menu changes (window visibility, running games, recent games).
+function updateTray() {
+  if (CLI_LAUNCH_ID) return;
+  if (loadSettings().trayIcon === false) {
+    tray?.destroy();
+    tray = null;
+    return;
+  }
+  if (!tray) {
+    tray = new Tray(nativeImage.createFromPath(APP_ICON).resize({ width: 32, height: 32 }));
+    tray.setToolTip('RohanKar Launcher');
+    tray.on('click', toggleWindow);
+  }
+
+  const recent = db?.prepare(`
+    SELECT identifier, title, exe_path, install_dir FROM games
+    WHERE last_played IS NOT NULL AND install_dir IS NOT NULL
+    ORDER BY last_played DESC LIMIT 5
+  `).all() || [];
+
+  const visible = !!mainWindow?.isVisible() && !mainWindow.isMinimized();
+  const template = [
+    { label: visible ? 'Hide RohanKar Launcher' : 'Show RohanKar Launcher', click: toggleWindow },
+    { type: 'separator' },
+  ];
+  if (recent.length) {
+    template.push({ label: 'Recently played', enabled: false });
+    for (const g of recent) {
+      const running = runningGames.has(g.identifier);
+      template.push({
+        label:   `${running ? '▶ ' : ''}${g.title || g.identifier}`,
+        enabled: !running,
+        click:   () => launchFromTray(g),
+      });
+    }
+    template.push({ type: 'separator' });
+  }
+  template.push({ label: 'Quit', click: () => { isQuitting = true; app.quit(); } });
+  tray.setContextMenu(Menu.buildFromTemplate(template));
+}
+
+async function launchFromTray(game) {
+  let exePath = game.exe_path;
+  if (!exePath) {
+    const exes = findExesInDir(game.install_dir);
+    // Several executables — let the user pick in the UI
+    if (exes.length !== 1) return showWindow();
+    exePath = exes[0];
+  }
+  const r = await launchGame(game.identifier, exePath, null);
+  if (!r.ok) dialog.showErrorBox('RohanKar Launcher', `Failed to launch ${game.title || game.identifier}:\n${r.error}`);
 }
 
 app.whenReady().then(() => {
+  if (!IS_PRIMARY) return;
   setDebug(loadSettings().debugLogging);
   if (CLI_LAUNCH_ID) return runHeadlessLaunch(CLI_LAUNCH_ID, CLI_LAUNCH_EXE);
   createWindow();
+  updateTray();
   setupAutoUpdater();
   // Validate installs on every launch — clears DB entries whose folders were deleted
   validateInstalls();
@@ -206,10 +307,12 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   // In headless launch mode there is never a window — quitting is handled on game exit
   if (CLI_LAUNCH_ID) return;
+  // Window destroyed while the tray keeps the launcher alive
+  if (tray && !isQuitting && loadSettings().closeToTray) return;
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('activate', () => {
-  if (!CLI_LAUNCH_ID && BrowserWindow.getAllWindows().length === 0) createWindow();
+  if (!CLI_LAUNCH_ID && IS_PRIMARY) showWindow();
 });
 
 // ─── Window controls ─────────────────────────────────────────────────────────
@@ -734,7 +837,11 @@ function unblockDirectory(dir) {
   return Promise.resolve();
 }
 
-ipcMain.handle('launch-game', (_, { identifier, exePath }) => {
+ipcMain.handle('launch-game', (_, { identifier, exePath, title }) => launchGame(identifier, exePath, title));
+
+// Launches from the UI or the tray. `title` (when known) is stored so the tray
+// can list recently played games by name.
+function launchGame(identifier, exePath, title) {
   return new Promise(async (resolve) => {
     if (!fs.existsSync(exePath)) return resolve({ ok: false, error: 'Executable not found: ' + exePath });
 
@@ -747,12 +854,16 @@ ipcMain.handle('launch-game', (_, { identifier, exePath }) => {
     if (!IS_WIN) {
       const r = startGame(identifier, exePath);
       if (!r.ok) return resolve(r);
+      markPlayed(identifier, title);
+      hideWhilePlaying();
       r.child.on('exit', (code) => {
         const secs = Math.round((Date.now() - r.start) / 1000);
         // A game that dies within seconds almost always failed to start — the
         // UI tells the user and points at the log instead of failing silently.
         const early = !r.inTerminal && secs < 15;
+        if (early || runningGames.size === 0) restoreAfterPlaying(early);
         mainWindow?.webContents.send('game-exited', { identifier, code, secs, early, logPath: r.logPath });
+        updateTray();
       });
       return resolve({ ok: true, runner: r.runnerName });
     }
@@ -763,15 +874,38 @@ ipcMain.handle('launch-game', (_, { identifier, exePath }) => {
       if (errMsg) {
         resolve({ ok: false, error: errMsg });
       } else {
+        markPlayed(identifier, title);
         // Track playtime roughly — we can't watch the process directly with openPath
         // so we record a start time and write it when the launcher is next focused.
         resolve({ ok: true });
       }
     });
   });
-});
+}
 
 // ─── Linux: run through Proton / Wine and track playtime ─────────────────────
+
+function markPlayed(identifier, title) {
+  if (!db) return;
+  db.prepare(`INSERT OR IGNORE INTO games (identifier, added_at) VALUES (?, ?)`).run(identifier, Date.now());
+  db.prepare('UPDATE games SET last_played = ?, title = COALESCE(?, title) WHERE identifier = ?').run(Date.now(), title || null, identifier);
+  updateTray();
+}
+
+// "Hide launcher while playing": to the tray if there is one, else minimized
+function hideWhilePlaying() {
+  if (!mainWindow || !loadSettings().hideWhilePlaying) return;
+  if (!mainWindow.isVisible() || mainWindow.isMinimized()) return;
+  hiddenForGame = true;
+  if (tray) mainWindow.hide();
+  else      mainWindow.minimize();
+}
+
+function restoreAfterPlaying(force) {
+  if (!hiddenForGame && !force) return;
+  hiddenForGame = false;
+  if (force || mainWindow) showWindow();
+}
 
 const runningGames = new Map(); // identifier → ChildProcess
 
@@ -823,7 +957,7 @@ function startGame(identifier, exePath) {
       `[RohanKar] cwd: ${launch.cwd}\n` +
       Object.entries(envDiff.set).map(([k, v]) => `[RohanKar] env ${k}=${v}\n`).join('') +
       envDiff.unset.map(k => `[RohanKar] env unset ${k}\n`).join('') +
-      `[RohanKar] Proton debug log: ${path.join(LOG_DIR, `steam-${launch.env.SteamGameId || '0'}.log`)}\n`;
+      `[RohanKar] Proton debug log: ${path.join(LOG_DIR, 'steam-*.log')}\n`;
   }
   fs.writeFileSync(logPath, header + '\n');
   console.log(`[launch] ${identifier} via ${launch.runnerName}: ${launch.cmd} ${launch.args.join(' ')} (cwd ${launch.cwd})`);
@@ -1242,6 +1376,7 @@ ipcMain.handle('delete-game', async (_, { identifier, installDir }) => {
       console.log(`[delete] No installDir provided — only clearing DB entry`);
     }
     if (db) db.prepare('DELETE FROM games WHERE identifier = ?').run(identifier);
+    updateTray();
     return { ok: true };
   } catch (e) {
     console.error(`[delete] Failed:`, e.message);

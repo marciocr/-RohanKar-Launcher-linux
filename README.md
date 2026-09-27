@@ -26,6 +26,7 @@ A desktop game launcher for the classic PC game collection uploaded to [Archive.
 - Smart exe picker for games with multiple launch options (e.g. DOSBox vs native)
 - Set a default executable so future launches skip the picker
 - Playtime tracking per game
+- Tray icon listing recently played games so you can launch them from the tray, with options to close to the tray, start minimized and hide the launcher while playing
 
 ### 🖼️ Game Detail Panel
 - Hero banner image — pulled automatically from a `hero.png` bundled in the game's archive
@@ -90,7 +91,7 @@ If [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) is insta
 #### Troubleshooting a game that won't start
 
 - If a game closes within a few seconds, the launcher says so and offers to open its log.
-- **Settings → Debug logging** (or start the launcher with `--debug`) logs every launcher step to `logs/launcher.log`. Game logs then also record the detected runners, working directory and environment variables, and Proton writes its own verbose `logs/steam-0.log` (`PROTON_LOG=1`).
+- **Settings → Debug logging** (or start the launcher with `--debug-log`) logs every launcher step to `logs/launcher.log`. Game logs then also record the detected runners, working directory and environment variables, and Proton writes its own verbose `logs/steam-*.log` (`PROTON_LOG=1`).
 - **Settings → Launch games in a terminal** runs the game in a terminal window so you can watch the output live. The launcher uses `$TERMINAL` if set, otherwise Konsole, GNOME Terminal, Ptyxis, kitty, Alacritty, xterm and others. The exact command is saved as `logs/<game>.sh`, which you can edit and re-run by hand.
 
 ### Add to Steam / Steam Deck
