@@ -541,7 +541,11 @@ function sanitizeFolderName(name) {
   return name.replace(/[.\s]+$/, '').replace(/[<>:"/\\|?*]/g, '_') || '_';
 }
 
-ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileName }) => {
+// Downloads go to "<name>.part" and are renamed when complete. A leftover
+// .part (launcher closed or connection lost mid-download) is resumed with an
+// HTTP Range request. When archive.org gave us the file's size and MD5, an
+// already-downloaded archive is reused and every download is checked.
+ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileName, expectedSize, md5 }) => {
   const settings    = loadSettings();
   const downloadDir = settings.downloadPath || DEFAULT_GAMES_DIR;
   const destDir     = path.join(downloadDir, sanitizeFolderName(identifier));
@@ -549,10 +553,47 @@ ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileNa
 
   const safeFileName = path.basename(fileName);
   const destFile     = path.join(destDir, safeFileName);
+  const partFile     = destFile + '.part';
+  expectedSize       = Number(expectedSize) || 0;
+
+  const send = (data) => {
+    try { if (!event.sender.isDestroyed()) event.sender.send('download-progress', { identifier, ...data }); } catch {}
+  };
+
+  // Hash check after download. Resolves to an error message or null.
+  const checkFile = async (file) => {
+    if (expectedSize && fs.statSync(file).size !== expectedSize) {
+      return `Downloaded file has the wrong size (${fs.statSync(file).size} of ${expectedSize} bytes)`;
+    }
+    if (!md5) return null;
+    send({ percent: 100, verifying: true });
+    const actual = await md5File(file);
+    return actual === md5.toLowerCase() ? null : 'Downloaded file is corrupted (MD5 mismatch)';
+  };
+
+  // Complete archive already on disk (kept after install, or a download that
+  // finished right before the launcher was closed) — reuse it
+  if (fs.existsSync(destFile) && expectedSize && fs.statSync(destFile).size === expectedSize) {
+    const err = await checkFile(destFile);
+    if (!err) {
+      console.log(`[download] ${identifier}: reusing ${destFile}`);
+      return { ok: true, filePath: destFile };
+    }
+    fs.rmSync(destFile, { force: true });
+  }
 
   return new Promise((resolve) => {
     // Track whether cancel has been called so we resolve exactly once
     let cancelled = false;
+    let settled   = false;
+    const finish  = (result) => {
+      // Quitting tears down the connection — leave the download pending (its
+      // .part stays) instead of reporting a failure that would drop it
+      if (settled || (isQuitting && !result.ok)) return;
+      settled = true;
+      activeDownloads.delete(identifier);
+      resolve(result);
+    };
 
     // Register a cancel hook immediately — before any HTTP request is made.
     // This lets download-cancel work even during redirects or slow connections.
@@ -560,36 +601,37 @@ ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileNa
       cancel: () => {
         if (cancelled) return;
         cancelled = true;
-        activeDownloads.delete(identifier);
-        resolve({ ok: false, error: 'Cancelled' });
+        finish({ ok: false, error: 'Cancelled' });
       },
       req:  null,
       file: null,
+      partFile,
     });
 
     const doRequest = (url, redirectCount) => {
       if (cancelled) return;
-      if (redirectCount > 10) {
-        activeDownloads.delete(identifier);
-        return resolve({ ok: false, error: 'Too many redirects' });
-      }
+      if (redirectCount > 10) return finish({ ok: false, error: 'Too many redirects' });
 
       const isHttps  = url.startsWith('https');
       const protocol = isHttps ? https : http;
 
-      const req = protocol.get(url, {
-        headers: { 'User-Agent': 'RohanKar-Launcher/0.4' },
-        timeout: 30000,
-      }, (res) => {
+      let offset = 0;
+      try { offset = fs.statSync(partFile).size; } catch {}
+      if (expectedSize && offset > expectedSize) { fs.rmSync(partFile, { force: true }); offset = 0; }
+
+      const headers = { 'User-Agent': 'RohanKar-Launcher/0.4' };
+      if (offset > 0) headers.Range = `bytes=${offset}-`;
+
+      const req = protocol.get(url, { headers, timeout: 30000 }, (res) => {
         if (cancelled) { res.resume(); return; }
 
-        const { statusCode, headers } = res;
+        const { statusCode } = res;
 
         // Follow redirects
-        if ([301,302,303,307,308].includes(statusCode) && headers.location) {
+        if ([301,302,303,307,308].includes(statusCode) && res.headers.location) {
           req.destroy();
           res.resume();
-          let next = headers.location;
+          let next = res.headers.location;
           if (next.startsWith('/')) {
             const base = new URL(url);
             next = `${base.protocol}//${base.host}${next}`;
@@ -598,15 +640,27 @@ ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileNa
           return;
         }
 
-        if (statusCode !== 200) {
+        // Range past the end — the .part is already complete (or garbage)
+        if (statusCode === 416) {
           res.resume();
-          activeDownloads.delete(identifier);
-          return resolve({ ok: false, error: `HTTP ${statusCode}` });
+          if (expectedSize && offset === expectedSize) return completePart();
+          fs.rmSync(partFile, { force: true });
+          return doRequest(url, redirectCount + 1);
         }
 
-        const total  = parseInt(headers['content-length'] || '0', 10);
-        let received = 0;
-        const file   = fs.createWriteStream(destFile);
+        if (statusCode !== 200 && statusCode !== 206) {
+          res.resume();
+          return finish({ ok: false, error: `HTTP ${statusCode}` });
+        }
+
+        // 206 = server honoured the Range; 200 = starting over from byte 0
+        const resuming = statusCode === 206;
+        if (!resuming) offset = 0;
+        if (resuming) console.log(`[download] ${identifier}: resuming at ${offset} bytes`);
+
+        const total  = offset + parseInt(res.headers['content-length'] || '0', 10);
+        let received = offset;
+        const file   = fs.createWriteStream(partFile, { flags: resuming ? 'a' : 'w' });
 
         // Update the active download entry with the live req and file
         const entry = activeDownloads.get(identifier);
@@ -615,29 +669,26 @@ ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileNa
         res.on('data', chunk => {
           if (cancelled) return;
           received += chunk.length;
-          if (total > 0) {
-            try {
-              if (!event.sender.isDestroyed()) {
-                event.sender.send('download-progress', { identifier, percent: Math.round(received / total * 100) });
-              }
-            } catch {}
-          }
+          if (total > 0) send({ percent: Math.round(received / total * 100) });
+        });
+
+        // Connection dropped mid-body — keep the .part so the next attempt resumes
+        res.on('close', () => {
+          if (cancelled || res.complete) return;
+          file.close();
+          finish({ ok: false, error: 'Connection lost — download again to resume from where it stopped' });
         });
 
         res.pipe(file);
 
         file.on('finish', () => {
-          if (cancelled) return;
-          file.close();
-          activeDownloads.delete(identifier);
-          resolve({ ok: true, filePath: destFile });
+          if (cancelled || settled) return;
+          file.close(() => completePart());
         });
 
         file.on('error', err => {
           if (cancelled) return;
-          fs.unlink(destFile, () => {});
-          activeDownloads.delete(identifier);
-          resolve({ ok: false, error: err.message });
+          finish({ ok: false, error: err.message });
         });
       });
 
@@ -648,20 +699,42 @@ ipcMain.handle('download-start', async (event, { identifier, downloadUrl, fileNa
       req.on('timeout', () => {
         if (cancelled) return;
         req.destroy();
-        activeDownloads.delete(identifier);
-        resolve({ ok: false, error: 'Connection timed out' });
+        finish({ ok: false, error: 'Connection timed out' });
       });
 
       req.on('error', err => {
         if (cancelled) return; // cancelled — already resolved, ignore
-        activeDownloads.delete(identifier);
-        resolve({ ok: false, error: err.message });
+        finish({ ok: false, error: err.message });
       });
+    };
+
+    const completePart = async () => {
+      if (expectedSize && fs.statSync(partFile).size < expectedSize) {
+        return finish({ ok: false, error: 'Download ended early — download again to resume from where it stopped' });
+      }
+      fs.renameSync(partFile, destFile);
+      const err = await checkFile(destFile);
+      if (err) {
+        fs.rmSync(destFile, { force: true });
+        console.error(`[download] ${identifier}: ${err}`);
+        return finish({ ok: false, error: err + ' — please download it again.' });
+      }
+      finish({ ok: true, filePath: destFile });
     };
 
     doRequest(downloadUrl, 0);
   });
 });
+
+function md5File(file) {
+  return new Promise((resolve, reject) => {
+    const hash = require('crypto').createHash('md5');
+    fs.createReadStream(file, { highWaterMark: 1 << 20 })
+      .on('data', c => hash.update(c))
+      .on('end', () => resolve(hash.digest('hex')))
+      .on('error', reject);
+  });
+}
 
 ipcMain.handle('download-cancel', (_, { identifier }) => {
   const dl = activeDownloads.get(identifier);
@@ -670,15 +743,37 @@ ipcMain.handle('download-cancel', (_, { identifier }) => {
     if (typeof dl.cancel === 'function') dl.cancel();
     // Also destroy req/file if they exist
     try { dl.req?.destroy(); }  catch {}
-    try { dl.file?.close();  }  catch {}
+    try { dl.file?.close(() => fs.rm(dl.partFile, { force: true }, () => {})); } catch {}
+    if (!dl.file) fs.rm(dl.partFile, { force: true }, () => {});
     activeDownloads.delete(identifier);
   }
   return { ok: true };
 });
 
-// ─── Extract ──────────────────────────────────────────────────────────────────
+// ─── Pending downloads (resumed on next start) ────────────────────────────────
+//
+// The renderer keeps this list in sync with its download queue. Entries still
+// here at startup were interrupted by the launcher closing and are restarted.
 
-ipcMain.handle('extract-archive', async (_, { filePath, identifier, subFolder }) => {
+const PENDING_DOWNLOADS_PATH = path.join(USER_DATA, 'pending-downloads.json');
+
+ipcMain.handle('pending-downloads-get', () => {
+  try { return JSON.parse(fs.readFileSync(PENDING_DOWNLOADS_PATH, 'utf8')); } catch { return []; }
+});
+
+ipcMain.handle('pending-downloads-save', (_, list) => {
+  if (list?.length) fs.writeFileSync(PENDING_DOWNLOADS_PATH, JSON.stringify(list, null, 2));
+  else              fs.rmSync(PENDING_DOWNLOADS_PATH, { force: true });
+  return { ok: true };
+});
+
+// ─── Extract ──────────────────────────────────────────────────────────────────
+//
+// `archive` ({ name, size, md5 } from archive.org) is recorded in the game's
+// integrity manifest together with each file's size and CRC32 as listed by
+// 7-Zip. `files` (optional) extracts only those paths — used by Repair.
+
+ipcMain.handle('extract-archive', async (_, { filePath, identifier, subFolder, archive, files }) => {
   const settings       = loadSettings();
   const installBase    = settings.installPath || DEFAULT_GAMES_DIR;
   // parentDir = the identifier's root folder (e.g. ni-ghts-into-dreams_202511)
@@ -696,54 +791,166 @@ ipcMain.handle('extract-archive', async (_, { filePath, identifier, subFolder })
 
   const ext = filePath.toLowerCase();
 
-  const unblockAfterExtract = () => unblockDirectory(destDir);
+  const done = async () => {
+    await unblockDirectory(destDir);
+    if (settings.deleteAfterInstall) {
+      fs.unlink(filePath, () => {
+        try { fs.rmdirSync(path.dirname(filePath)); } catch {}
+      });
+    }
+    return { ok: true, installDir: destDir, parentInstallDir: parentDir };
+  };
 
-  const extractors = findExtractors(ext, filePath, destDir);
-  if (extractors.length) {
-    let lastErr = null;
-    for (const [cmd, args] of extractors) {
-      const err = await new Promise(res => execFile(cmd, args, { maxBuffer: 64 * 1024 * 1024 }, e => res(e)));
-      if (!err) {
-        lastErr = null;
-        break;
-      }
-      console.warn(`[extract] ${path.basename(cmd)} failed: ${err.message}`);
-      lastErr = err;
-    }
-    if (!lastErr) {
-      await unblockAfterExtract();
-      if (settings.deleteAfterInstall) {
-        fs.unlink(filePath, () => {
-          try { fs.rmdirSync(path.dirname(filePath)); } catch {}
-        });
-      }
-      return { ok: true, installDir: destDir, parentInstallDir: parentDir };
-    }
-    if (!ext.endsWith('.zip')) return { ok: false, error: lastErr.message };
-    // .zip: fall through to extract-zip below
+  // Record what the archive contains before extracting (the archive may be
+  // deleted afterwards). Failing to list it only disables the integrity check.
+  const entries = await listArchive(filePath);
+  if (entries) saveManifestArchive(identifier, archive || { name: path.basename(filePath) }, subFolder, destDir, entries);
+  else console.warn(`[extract] Could not list ${filePath} — integrity check unavailable for it`);
+
+  // Repair: extract only the given files (7-Zip only; otherwise extract everything)
+  let listFile = null;
+  if (files?.length) {
+    listFile = path.join(app.getPath('temp'), `rohankar-repair-${process.pid}-${Date.now()}.txt`);
+    fs.writeFileSync(listFile, files.join('\n'));
   }
 
-  // fallback: extract-zip for .zip
-  if (ext.endsWith('.zip')) {
-    try {
-      const extractZip = require('extract-zip');
-      await extractZip(filePath, { dir: destDir });
-      await unblockAfterExtract();
-      if (settings.deleteAfterInstall) {
-        fs.unlink(filePath, () => {
-          try { fs.rmdirSync(path.dirname(filePath)); } catch {}
-        });
+  try {
+    const extractors = findExtractors(ext, filePath, destDir, listFile);
+    if (extractors.length) {
+      let lastErr = null;
+      for (const [cmd, args] of extractors) {
+        const err = await new Promise(res => execFile(cmd, args, { maxBuffer: 64 * 1024 * 1024 }, e => res(e)));
+        if (!err) {
+          lastErr = null;
+          break;
+        }
+        console.warn(`[extract] ${path.basename(cmd)} failed: ${err.message}`);
+        lastErr = err;
       }
-      return { ok: true, installDir: destDir, parentInstallDir: parentDir };
-    } catch (e) {
-      return { ok: false, error: e.message };
+      if (!lastErr) return await done();
+      if (!ext.endsWith('.zip')) return { ok: false, error: lastErr.message };
+      // .zip: fall through to extract-zip below
     }
+
+    // fallback: extract-zip for .zip
+    if (ext.endsWith('.zip')) {
+      try {
+        const extractZip = require('extract-zip');
+        await extractZip(filePath, { dir: destDir });
+        return await done();
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    }
+  } finally {
+    if (listFile) fs.rm(listFile, { force: true }, () => {});
   }
 
   if (ext.endsWith('.rar')) {
     return { ok: false, error: 'RAR support needs 7-Zip or unrar. Install it with your package manager (e.g. "sudo dnf install 7zip" or "sudo apt install 7zip unrar").' };
   }
   return { ok: false, error: 'Unsupported archive format' };
+});
+
+// ─── Integrity manifest + verification ───────────────────────────────────────
+//
+// <userData>/manifests/<identifier>.json:
+//   { version: 1, archives: { "<archive name>": {
+//       file: { name, size, md5 }, subFolder, destDir,
+//       entries: [[relativePath, size, crc32Hex], …] } } }
+
+const MANIFEST_DIR = path.join(USER_DATA, 'manifests');
+const manifestPath = (identifier) => path.join(MANIFEST_DIR, `${sanitizeFolderName(identifier)}.json`);
+
+function loadManifest(identifier) {
+  try { return JSON.parse(fs.readFileSync(manifestPath(identifier), 'utf8')); } catch { return null; }
+}
+
+function saveManifestArchive(identifier, archive, subFolder, destDir, entries) {
+  const m = loadManifest(identifier) || { version: 1, archives: {} };
+  m.archives[archive.name] = {
+    file: { name: archive.name, size: archive.size || null, md5: archive.md5 || null },
+    subFolder: subFolder || null,
+    destDir,
+    entries,
+  };
+  fs.mkdirSync(MANIFEST_DIR, { recursive: true });
+  fs.writeFileSync(manifestPath(identifier), JSON.stringify(m));
+}
+
+// Lists an archive's files with size and CRC32 using 7-Zip → [[path, size, crc], …]
+async function listArchive(filePath) {
+  const bins = ['7zz', '7z', '7za'].map(b => runners.which(b)).filter(Boolean);
+  const b = bundled7za();
+  if (b && !filePath.toLowerCase().endsWith('.rar')) bins.push(b);
+  for (const bin of bins) {
+    const out = await new Promise(res => execFile(bin, ['l', '-slt', '-ba', '-sccUTF-8', filePath],
+      { maxBuffer: 256 * 1024 * 1024 }, (e, stdout) => res(e ? null : stdout)));
+    if (!out) continue;
+    const entries = [];
+    for (const block of out.split(/\r?\n\r?\n/)) {
+      const f = {};
+      for (const line of block.split(/\r?\n/)) {
+        const i = line.indexOf(' = ');
+        if (i > 0) f[line.slice(0, i)] = line.slice(i + 3);
+      }
+      if (!f.Path || f.Folder === '+' || /D/.test(f.Attributes || '')) continue;
+      entries.push([f.Path.replace(/\\/g, '/'), Number(f.Size) || 0, (f.CRC || '').toLowerCase()]);
+    }
+    if (entries.length) return entries;
+  }
+  return null;
+}
+
+function crc32File(file) {
+  return new Promise((resolve, reject) => {
+    let crc = 0;
+    fs.createReadStream(file, { highWaterMark: 1 << 20 })
+      .on('data', c => { crc = require('zlib').crc32(c, crc); })
+      .on('end', () => resolve((crc >>> 0).toString(16).padStart(8, '0')))
+      .on('error', reject);
+  });
+}
+
+// Compares installed files with the manifest. Files the game itself rewrites
+// (settings .ini/.cfg) also show up as "changed"; the UI says so.
+ipcMain.handle('verify-install', async (event, { identifier }) => {
+  const m = loadManifest(identifier);
+  if (!m || !Object.keys(m.archives).length) return { ok: true, hasManifest: false };
+
+  const all = Object.values(m.archives);
+  const totalBytes = all.reduce((n, a) => n + a.entries.reduce((s, e) => s + e[1], 0), 0) || 1;
+  let doneBytes = 0;
+  let lastSent  = 0;
+  const progress = (force) => {
+    const now = Date.now();
+    if (!force && now - lastSent < 150) return;
+    lastSent = now;
+    try { event.sender.send('verify-progress', { identifier, percent: Math.min(100, Math.round(doneBytes / totalBytes * 100)) }); } catch {}
+  };
+
+  const archives = [];
+  for (const a of all) {
+    const missing = [];
+    const changed = [];
+    for (const [rel, size, crc] of a.entries) {
+      const full = path.join(a.destDir, rel);
+      let st = null;
+      try { st = fs.statSync(full); } catch {}
+      if (!st || !st.isFile()) missing.push(rel);
+      else if (st.size !== size) changed.push(rel);
+      else if (crc && size > 0) {
+        try { if (await crc32File(full) !== crc) changed.push(rel); }
+        catch { changed.push(rel); }
+      }
+      doneBytes += size;
+      progress();
+    }
+    archives.push({ file: a.file, subFolder: a.subFolder, total: a.entries.length, missing, changed });
+  }
+  progress(true);
+  console.log(`[verify] ${identifier}: ` + archives.map(a => `${a.file.name}: ${a.missing.length} missing, ${a.changed.length} changed of ${a.total}`).join('; '));
+  return { ok: true, hasManifest: true, archives };
 });
 
 // Path to the 7za binary bundled via the 7zip-bin package (handles .zip/.7z,
@@ -756,9 +963,10 @@ function bundled7za() {
 }
 
 // Ordered list of [cmd, args] that can extract this archive, best first.
-function findExtractors(ext, filePath, destDir) {
+// With `listFile` only the paths listed in it are extracted, which only 7-Zip supports.
+function findExtractors(ext, filePath, destDir, listFile) {
   const list = [];
-  const sevenZipArgs = ['x', filePath, `-o${destDir}`, '-y'];
+  const sevenZipArgs = ['x', filePath, `-o${destDir}`, '-y', ...(listFile ? ['-sccUTF-8', '-scsUTF-8', `@${listFile}`] : [])];
   const isArchive = ext.endsWith('.zip') || ext.endsWith('.7z') || ext.endsWith('.rar');
   if (!isArchive) return list;
 
@@ -773,6 +981,7 @@ function findExtractors(ext, filePath, destDir) {
     const p = runners.which(bin);
     if (p) list.push([p, sevenZipArgs]);
   }
+  // unrar/bsdtar ignore `listFile` and extract everything — slower, still correct
   if (ext.endsWith('.rar')) {
     const unrar = runners.which('unrar');
     if (unrar) list.push([unrar, ['x', '-o+', filePath, destDir + path.sep]]);
@@ -1347,9 +1556,13 @@ ipcMain.handle('scan-for-games', (_, { scanDir, knownIdentifiers, titleMap }) =>
 
 ipcMain.handle('install-game', (_, { identifier, installDir, exePath }) => {
   if (!db) return { ok: false };
+  // Upsert — a reinstall/repair keeps playtime, favorites, notes and the default exe
   db.prepare(`
-    INSERT OR REPLACE INTO games (identifier, install_dir, exe_path, added_at)
+    INSERT INTO games (identifier, install_dir, exe_path, added_at)
     VALUES (?, ?, ?, ?)
+    ON CONFLICT(identifier) DO UPDATE SET
+      install_dir = excluded.install_dir,
+      exe_path    = COALESCE(excluded.exe_path, games.exe_path)
   `).run(identifier, installDir, exePath || null, Date.now());
   return { ok: true };
 });
@@ -1376,6 +1589,7 @@ ipcMain.handle('delete-game', async (_, { identifier, installDir }) => {
       console.log(`[delete] No installDir provided — only clearing DB entry`);
     }
     if (db) db.prepare('DELETE FROM games WHERE identifier = ?').run(identifier);
+    fs.rmSync(manifestPath(identifier), { force: true });
     updateTray();
     return { ok: true };
   } catch (e) {

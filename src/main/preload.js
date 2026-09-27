@@ -36,6 +36,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Extract / Install / Delete
   extractArchive: (opts)  => ipcRenderer.invoke('extract-archive', opts),
+  getPendingDownloads:  ()     => ipcRenderer.invoke('pending-downloads-get'),
+  savePendingDownloads: (list) => ipcRenderer.invoke('pending-downloads-save', list),
+  verifyInstall:  (opts)  => ipcRenderer.invoke('verify-install', opts),
+  onVerifyProgress: (cb)  => ipcRenderer.on('verify-progress', (_, data) => cb(data)),
   installGame:    (opts)  => ipcRenderer.invoke('install-game',    opts),
   setExePath:     (opts)  => ipcRenderer.invoke('set-exe-path',    opts),
   deleteGame:     (opts)  => ipcRenderer.invoke('delete-game',     opts),

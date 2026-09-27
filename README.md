@@ -20,6 +20,10 @@ A desktop game launcher for the classic PC game collection uploaded to [Archive.
 - One-click download and automatic extraction (ZIP, 7z, RAR supported)
 - Optionally deletes the archive after installation to save space
 - Configurable download and install folder locations
+- Downloads one game at a time by default (up to 5 at once, configurable); the rest wait in a queue
+- Interrupted downloads resume where they stopped, including after closing the launcher
+- Every download is checked against the MD5 published by Archive.org
+- **Verify** compares installed files with the original archive (size + CRC32) and **Repair** restores only the missing or changed ones; **Reinstall** downloads and extracts the game again, keeping saves and settings
 
 ### 🚀 Launching
 - Automatically finds and launches the correct executable

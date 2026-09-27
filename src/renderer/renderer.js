@@ -69,6 +69,25 @@ function dropQueuedDownload(queueKey) {
   if (i >= 0) downloadWaiters.splice(i, 1)[0].resolve(false);
 }
 
+// Downloads not yet installed, saved to disk so they resume (from their .part
+// file) if the launcher is closed: queueKey → startSingleDownload arguments
+const pendingDownloads = new Map();
+
+function setPendingDownload(queueKey, args) {
+  if (args) pendingDownloads.set(queueKey, args);
+  else      pendingDownloads.delete(queueKey);
+  window.electronAPI.savePendingDownloads([...pendingDownloads.values()]);
+}
+
+async function resumePendingDownloads() {
+  const list = await window.electronAPI.getPendingDownloads();
+  for (const d of list || []) {
+    if (!d?.queueKey || !d.file?.name) continue;
+    console.log('[resume] resuming download', d.queueKey);
+    startSingleDownload(d.queueKey, d.title, d.file, d.parentId, { onlyFiles: d.onlyFiles });
+  }
+}
+
 // Download history: session-persistent record of all downloads
 // { identifier, title, status, percent, startedAt, finishedAt }
 const downloadHistory = [];
@@ -160,6 +179,8 @@ const btnDownload             = document.getElementById('btn-download');
 const btnLaunch               = document.getElementById('btn-launch');
 const btnDelete               = document.getElementById('btn-delete');
 const btnOpenLocation         = document.getElementById('btn-open-location');
+const btnVerify               = document.getElementById('btn-verify');
+const btnReinstall            = document.getElementById('btn-reinstall');
 const btnClearDefault         = document.getElementById('btn-clear-default');
 const progressWrap            = document.getElementById('progress-wrap');
 const progressBar             = document.getElementById('progress-bar');
@@ -462,6 +483,8 @@ async function init() {
   btnLaunch.addEventListener('click',   onLaunch);
   btnDelete.addEventListener('click',   onDelete);
   btnOpenLocation.addEventListener('click', onOpenLocation);
+  btnVerify.addEventListener('click', onVerify);
+  btnReinstall.addEventListener('click', onReinstall);
   btnClearDefault.addEventListener('click', onClearDefault);
   btnCancelDownload.addEventListener('click', onCancelDownload);
 
@@ -528,6 +551,7 @@ async function init() {
   const initSettings = await window.electronAPI.getSettings();
   installedFirst     = !!initSettings.installedFirst;
   maxConcurrentDownloads = initSettings.maxConcurrentDownloads || 1;
+  resumePendingDownloads();
   showInstalledBadge = initSettings.showInstalledBadge !== false; // default true
   applyInstalledBadgeSetting();
 
@@ -579,15 +603,17 @@ async function init() {
   // Scan for pre-existing installs
   document.getElementById('btn-scan-games').addEventListener('click', onScanForGames);
 
+  window.electronAPI.onVerifyProgress((data) => verifyProgressCb?.(data));
+
   // Download progress
-  window.electronAPI.onDownloadProgress(({ identifier, percent }) => {
+  window.electronAPI.onDownloadProgress(({ identifier, percent, verifying }) => {
     // Strictly ignore if not in queue or not actively downloading
     const entry = downloadQueue.get(identifier);
     if (!entry || entry.status !== 'downloading') return;
-    dqSet(identifier, { percent });
+    dqSet(identifier, { percent, verifying: !!verifying });
     if (selectedGame?.identifier === identifier) {
       progressBar.style.width  = percent + '%';
-      progressText.textContent = percent + '%';
+      progressText.textContent = verifying ? 'Verifying…' : percent + '%';
     }
   });
 
@@ -1062,6 +1088,7 @@ function updateDownloadsModalProgress(identifier, entry) {
 
 function activeDownloadMeta(entry) {
   if (entry.status === 'queued')     return 'Waiting for another download to finish…';
+  if (entry.verifying && entry.status === 'downloading') return 'Verifying download…';
   if (entry.status === 'extracting') return 'Extracting…';
   return `${entry.percent ?? 0}%`;
 }
@@ -1428,6 +1455,7 @@ async function refreshButtonStates() {
   btnDownload.disabled = installed || downloadQueue.has(selectedGame.identifier);
   btnLaunch.disabled   = !installed;
   btnDelete.disabled   = !installed;
+  const busy = [...downloadQueue.keys()].some(k => k === selectedGame.identifier || k.startsWith(selectedGame.identifier + ':'));
   if (installed) {
     btnOpenLocation.classList.remove('hidden');
     document.getElementById('btn-add-to-steam')?.classList.remove('hidden');
@@ -1435,6 +1463,10 @@ async function refreshButtonStates() {
     btnOpenLocation.classList.add('hidden');
     document.getElementById('btn-add-to-steam')?.classList.add('hidden');
   }
+  btnVerify.classList.toggle('hidden', !installed);
+  btnReinstall.classList.toggle('hidden', !installed);
+  btnVerify.disabled    = busy;
+  btnReinstall.disabled = busy;
   if (installed && lib?.exe_path) {
     const exePaths = await window.electronAPI.findExes({ installDir: lib.install_dir });
     if (exePaths.length > 1) btnClearDefault.classList.remove('hidden');
@@ -1631,9 +1663,27 @@ function showArchivePicker(identifier, archives) {
 // parentId   — for collection items, the archive.org identifier (used for install_dir naming)
 //              When set, this game extracts into a subfolder inside the parent's install dir,
 //              and the parent identifier is registered as the installed entry (not the individual game).
-async function startSingleDownload(queueKey, title, file, parentId) {
+// opts.onlyFiles — extract only these paths (Repair)
+async function startSingleDownload(queueKey, title, file, parentId, opts = {}) {
   const identifier = parentId || queueKey;
   if (downloadQueue.has(queueKey)) return;
+
+  // Remembered until installed, cancelled or failed, so closing the launcher
+  // mid-download resumes it on the next start
+  setPendingDownload(queueKey, {
+    queueKey, title, parentId: parentId || null,
+    file: { name: file.name, size: file.size || null, md5: file.md5 || null },
+    onlyFiles: opts.onlyFiles || null,
+  });
+  try {
+    await runSingleDownload(queueKey, title, file, parentId, opts);
+  } finally {
+    setPendingDownload(queueKey, null);
+  }
+}
+
+async function runSingleDownload(queueKey, title, file, parentId, opts) {
+  const identifier = parentId || queueKey;
 
   const encodedName = file.name.split('/').map(encodeURIComponent).join('/');
   const fileUrl     = `https://archive.org/download/${identifier}/${encodedName}`;
@@ -1643,7 +1693,7 @@ async function startSingleDownload(queueKey, title, file, parentId) {
   // Only show inline progress bar for single-game installs (not collection items)
   const isPrimary = !parentId;
   const showInline = () => selectedGame?.identifier === queueKey;
-  if (isPrimary) {
+  if (isPrimary && showInline()) {
     btnDownload.disabled = true;
     progressWrap.classList.remove('hidden');
     progressBar.style.width  = '0%';
@@ -1659,9 +1709,11 @@ async function startSingleDownload(queueKey, title, file, parentId) {
   let result;
   try {
     result = await window.electronAPI.downloadStart({
-      identifier: queueKey,
-      downloadUrl: fileUrl,
-      fileName:    file.name,
+      identifier:   queueKey,
+      downloadUrl:  fileUrl,
+      fileName:     file.name,
+      expectedSize: file.size,
+      md5:          file.md5,
     });
   } finally {
     releaseDownloadSlot();
@@ -1673,6 +1725,8 @@ async function startSingleDownload(queueKey, title, file, parentId) {
   }
 
   if (!result.ok) {
+    console.warn(`[download] ${queueKey} failed: ${result.error}`);
+    if (isPrimary && showInline()) alert(`Download failed: ${result.error}`);
     dqSet(queueKey, { status: 'error', finishedAt: Date.now() });
     setTimeout(() => { downloadQueue.delete(queueKey); updateDownloadsButton(); }, 4000);
     if (isPrimary) { progressWrap.classList.add('hidden'); refreshButtonStates(); }
@@ -1692,6 +1746,8 @@ async function startSingleDownload(queueKey, title, file, parentId) {
     filePath:    result.filePath,
     identifier:  identifier,           // always the archive.org identifier for the parent dir
     subFolder:   parentId ? title : null, // subfolder name = game title for collection items
+    archive:     { name: file.name, size: Number(file.size) || null, md5: file.md5 || null },
+    files:       opts.onlyFiles || null,
   });
 
   if (isPrimary) progressWrap.classList.add('hidden');
@@ -1920,6 +1976,131 @@ async function onDelete() {
   refreshButtonStates();
   renderLibraryGrid();
   renderHomeStats();
+}
+
+// ─── Verify / Repair / Reinstall ─────────────────────────────────────────────
+
+async function onReinstall() {
+  if (!selectedGame) return;
+  if (!confirm(`Reinstall ${getTitle(selectedGame)}?\n\nThe game is downloaded again (unless the archive is still on disk) and extracted over the current files. ` +
+    `Saves and settings in the Proton prefix are kept, as are extra files in the game folder.`)) return;
+  await onDownload();
+}
+
+async function onVerify() {
+  if (!selectedGame) return;
+  const game       = selectedGame;
+  const identifier = game.identifier;
+
+  const { overlay, body, btnRow } = openVerifyModal(`Verifying ${getTitle(game)}`);
+  body.innerHTML = '<p>Checking installed files…</p><div class="dm-bar-wrap"><div class="dm-bar" style="width:0%"></div></div><p class="verify-percent">0%</p>';
+  const bar = body.querySelector('.dm-bar');
+  const pct = body.querySelector('.verify-percent');
+  verifyProgressCb = ({ identifier: id, percent }) => {
+    if (id !== identifier) return;
+    bar.style.width = percent + '%';
+    pct.textContent = percent + '%';
+  };
+
+  const result = await window.electronAPI.verifyInstall({ identifier });
+  verifyProgressCb = null;
+  if (!document.body.contains(overlay)) return; // closed while verifying
+
+  overlay.querySelector('h3').textContent = `${getTitle(game)} — file check`;
+  const close = addVerifyButton(btnRow, 'Close', 'exe-picker-cancel', () => overlay.remove());
+
+  if (!result.hasManifest) {
+    body.innerHTML = `<p>There is no integrity data for this game — it was installed with an older version of the launcher.</p>` +
+      `<p>Use <b>Reinstall</b> to download it again; after that it can be verified.</p>`;
+    addVerifyButton(btnRow, '↻ Reinstall', 'exe-picker-launch', () => { overlay.remove(); onReinstall(); }, close);
+    return;
+  }
+
+  const broken = result.archives.filter(a => a.missing.length || a.changed.length);
+  const total  = result.archives.reduce((n, a) => n + a.total, 0);
+  if (!broken.length) {
+    body.innerHTML = `<p class="verify-ok">✓ All ${total} files are intact.</p>`;
+    return;
+  }
+
+  body.innerHTML = '';
+  const intro = document.createElement('p');
+  const nMissing = broken.reduce((n, a) => n + a.missing.length, 0);
+  const nChanged = broken.reduce((n, a) => n + a.changed.length, 0);
+  intro.textContent = `${nMissing} missing and ${nChanged} changed file(s) out of ${total}.`;
+  body.appendChild(intro);
+  const hint = document.createElement('p');
+  hint.className   = 'settings-hint';
+  hint.textContent = 'Games rewrite some of their own files (settings such as .ini/.cfg), so a few "changed" files can be normal. Repair restores them to the original version.';
+  body.appendChild(hint);
+
+  const list = document.createElement('ul');
+  list.className = 'exe-picker-list verify-list';
+  for (const a of broken) {
+    const head = document.createElement('li');
+    head.className   = 'exe-picker-group-header';
+    head.textContent = a.subFolder || a.file.name;
+    list.appendChild(head);
+    const rows = [...a.missing.map(f => ['missing', f]), ...a.changed.map(f => ['changed', f])];
+    for (const [kind, f] of rows.slice(0, 200)) {
+      const li = document.createElement('li');
+      li.className   = 'verify-file ' + kind;
+      li.textContent = `${kind === 'missing' ? '✕' : '≠'} ${f}`;
+      list.appendChild(li);
+    }
+    if (rows.length > 200) {
+      const li = document.createElement('li');
+      li.className   = 'verify-file';
+      li.textContent = `… and ${rows.length - 200} more`;
+      list.appendChild(li);
+    }
+  }
+  body.appendChild(list);
+
+  addVerifyButton(btnRow, '🛠 Repair', 'exe-picker-launch', () => {
+    overlay.remove();
+    for (const a of broken) {
+      const onlyFiles = [...a.missing, ...a.changed];
+      if (a.subFolder) startSingleDownload(`${identifier}:${a.file.name}`, a.subFolder, a.file, identifier, { onlyFiles });
+      else             startSingleDownload(identifier, getTitle(game), a.file, undefined, { onlyFiles });
+    }
+    refreshButtonStates();
+  }, close);
+}
+
+let verifyProgressCb = null;
+
+function openVerifyModal(title) {
+  const overlay = document.createElement('div');
+  overlay.className = 'exe-picker-overlay';
+  const modal = document.createElement('div');
+  modal.className = 'exe-picker-modal verify-modal';
+  const header = document.createElement('div');
+  header.className = 'exe-picker-header';
+  const h3 = document.createElement('h3');
+  h3.textContent = title;
+  header.appendChild(h3);
+  const body = document.createElement('div');
+  body.className = 'verify-body';
+  const footer = document.createElement('div');
+  footer.className = 'exe-picker-footer';
+  const btnRow = document.createElement('div');
+  btnRow.className = 'exe-picker-btn-row';
+  footer.appendChild(btnRow);
+  modal.append(header, body, footer);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  return { overlay, body, btnRow };
+}
+
+function addVerifyButton(row, label, cls, onClick, before) {
+  const b = document.createElement('button');
+  b.className   = cls;
+  b.textContent = label;
+  b.addEventListener('click', onClick);
+  if (before) row.insertBefore(b, before);
+  else        row.appendChild(b);
+  return b;
 }
 
 // ─── Favorites ────────────────────────────────────────────────────────────────
