@@ -341,6 +341,22 @@
         <input id="setting-use-umu" type="checkbox" />
       </div>
 
+      <div class="settings-row settings-check-row settings-linux-only hidden">
+        <label for="setting-launch-in-terminal">Launch games in a terminal<br><span class="settings-hint">Shows Proton/Wine output live. The command is saved as a .sh script in the logs folder.</span></label>
+        <input id="setting-launch-in-terminal" type="checkbox" />
+      </div>
+
+      <div class="settings-row settings-check-row">
+        <label for="setting-debug-logging">Debug logging<br><span class="settings-hint">Logs every launcher step to launcher.log, with more detail in game logs (enables PROTON_LOG).</span></label>
+        <input id="setting-debug-logging" type="checkbox" />
+      </div>
+
+      <div class="settings-row">
+        <div class="settings-path-row">
+          <button id="btn-open-logs">📄 Open Logs Folder</button>
+        </div>
+      </div>
+
       <div class="settings-row">
         <label>Detect pre-installed games</label>
         <div class="settings-path-row">

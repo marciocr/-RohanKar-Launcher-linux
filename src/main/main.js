@@ -27,6 +27,7 @@ const LEGACY_DB_PATH   = path.join(USER_DATA, 'library.json');
 const SETTINGS_PATH    = path.join(USER_DATA, 'settings.json');
 
 const THUMB_CACHE_DIR  = path.join(USER_DATA, 'thumbcache');
+const LOG_DIR          = path.join(USER_DATA, 'logs');
 
 [DEFAULT_GAMES_DIR, THUMB_CACHE_DIR].forEach(d => {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
@@ -50,6 +51,34 @@ function getArgValue(flag) {
 }
 const CLI_LAUNCH_ID  = getArgValue('--launch');
 const CLI_LAUNCH_EXE = getArgValue('--exe');
+const CLI_DEBUG      = process.argv.includes('--debug');
+
+// ─── Debug log ────────────────────────────────────────────────────────────────
+//
+// With "Debug logging" enabled in Settings (or --debug on the command line),
+// everything the main process prints is also appended to <userData>/logs/launcher.log.
+
+const LAUNCHER_LOG = path.join(LOG_DIR, 'launcher.log');
+let debugEnabled   = false;
+
+function setDebug(on) {
+  on = !!on || CLI_DEBUG;
+  if (on && !debugEnabled) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(LAUNCHER_LOG, `\n===== ${new Date().toISOString()} RohanKar Launcher ${app.getVersion()} — debug logging on =====\n`);
+  }
+  debugEnabled = on;
+}
+
+for (const level of ['log', 'warn', 'error']) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    orig(...args);
+    if (!debugEnabled) return;
+    const line = args.map(a => typeof a === 'string' ? a : require('util').inspect(a)).join(' ');
+    try { fs.appendFileSync(LAUNCHER_LOG, `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${line}\n`); } catch {}
+  };
+}
 
 // ─── SQLite ───────────────────────────────────────────────────────────────────
 
@@ -145,6 +174,7 @@ function loadSettings() {
 
 function saveSettings(data) {
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(data, null, 2));
+  setDebug(data.debugLogging);
 }
 
 // ─── Window ───────────────────────────────────────────────────────────────────
@@ -166,6 +196,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  setDebug(loadSettings().debugLogging);
   if (CLI_LAUNCH_ID) return runHeadlessLaunch(CLI_LAUNCH_ID, CLI_LAUNCH_EXE);
   createWindow();
   setupAutoUpdater();
@@ -716,7 +747,13 @@ ipcMain.handle('launch-game', (_, { identifier, exePath }) => {
     if (!IS_WIN) {
       const r = startGame(identifier, exePath);
       if (!r.ok) return resolve(r);
-      r.child.on('exit', () => mainWindow?.webContents.send('game-exited', { identifier }));
+      r.child.on('exit', (code) => {
+        const secs = Math.round((Date.now() - r.start) / 1000);
+        // A game that dies within seconds almost always failed to start — the
+        // UI tells the user and points at the log instead of failing silently.
+        const early = !r.inTerminal && secs < 15;
+        mainWindow?.webContents.send('game-exited', { identifier, code, secs, early, logPath: r.logPath });
+      });
       return resolve({ ok: true, runner: r.runnerName });
     }
 
@@ -746,36 +783,76 @@ function addPlaytime(identifier, secs) {
 
 // Spawns the game with the configured runner. Output goes to
 // <userData>/logs/<identifier>.log so Proton/Wine errors can be inspected.
+// With "Launch in terminal" enabled, the command is written to
+// <userData>/logs/<identifier>.sh and run inside a terminal window instead.
 function startGame(identifier, exePath) {
   if (runningGames.has(identifier)) return { ok: false, error: 'This game is already running.' };
 
   const settings = loadSettings();
   const safeId   = sanitizeFolderName(identifier);
+  const runnerId = settings.runner || 'auto';
+  const useUmu   = settings.useUmu !== false;
   const launch   = runners.buildLaunchCommand({
     exePath,
     prefixDir: path.join(PREFIXES_DIR, safeId),
-    runnerId:  settings.runner || 'auto',
-    useUmu:    settings.useUmu !== false,
+    runnerId,
+    useUmu,
   });
-  if (launch.error) return { ok: false, error: launch.error };
+  if (launch.error) {
+    console.error(`[launch] ${identifier}: ${launch.error}`);
+    return { ok: false, error: launch.error };
+  }
 
-  const logDir = path.join(USER_DATA, 'logs');
-  fs.mkdirSync(logDir, { recursive: true });
-  const logFd = fs.openSync(path.join(logDir, `${safeId}.log`), 'w');
-  fs.writeSync(logFd, `[RohanKar] ${new Date().toISOString()} runner=${launch.runnerName}\n[RohanKar] ${launch.cmd} ${launch.args.join(' ')}\n\n`);
-  console.log(`[launch] ${identifier} via ${launch.runnerName}`);
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  const logPath = path.join(LOG_DIR, `${safeId}.log`);
+  const envDiff = diffEnv(process.env, launch.env);
+
+  if (debugEnabled) {
+    launch.env.PROTON_LOG     = launch.env.PROTON_LOG || '1';
+    launch.env.PROTON_LOG_DIR = LOG_DIR;
+    envDiff.set.PROTON_LOG     = launch.env.PROTON_LOG;
+    envDiff.set.PROTON_LOG_DIR = LOG_DIR;
+  }
+
+  let header = `[RohanKar] ${new Date().toISOString()} runner=${launch.runnerName}\n[RohanKar] ${launch.cmd} ${launch.args.join(' ')}\n`;
+  if (debugEnabled) {
+    const info = runners.listRunners();
+    header +=
+      `[RohanKar] settings: runner=${runnerId} useUmu=${useUmu} launchInTerminal=${!!settings.launchInTerminal}\n` +
+      `[RohanKar] detected runners: ${info.runners.map(r => r.name).join(', ') || '(none)'}; umu-run ${info.umuAvailable ? 'found' : 'not found'}\n` +
+      `[RohanKar] cwd: ${launch.cwd}\n` +
+      Object.entries(envDiff.set).map(([k, v]) => `[RohanKar] env ${k}=${v}\n`).join('') +
+      envDiff.unset.map(k => `[RohanKar] env unset ${k}\n`).join('') +
+      `[RohanKar] Proton debug log: ${path.join(LOG_DIR, `steam-${launch.env.SteamGameId || '0'}.log`)}\n`;
+  }
+  fs.writeFileSync(logPath, header + '\n');
+  console.log(`[launch] ${identifier} via ${launch.runnerName}: ${launch.cmd} ${launch.args.join(' ')} (cwd ${launch.cwd})`);
+
+  let cmd  = launch.cmd;
+  let args = launch.args;
+  let stdio;
+  let logFd;
+  if (settings.launchInTerminal) {
+    const script = path.join(LOG_DIR, `${safeId}.sh`);
+    fs.writeFileSync(script, buildLaunchScript(identifier, launch, envDiff, logPath), { mode: 0o755 });
+    const term = findTerminal(script);
+    if (!term) return { ok: false, error: `No terminal emulator found. Install konsole, gnome-terminal, alacritty or xterm, or run the script by hand:\n${script}` };
+    [cmd, ...args] = term;
+    stdio = 'ignore';
+    console.log(`[launch] ${identifier} in terminal: ${term.join(' ')}`);
+  } else {
+    logFd = fs.openSync(logPath, 'a');
+    stdio = ['ignore', logFd, logFd];
+  }
 
   let child;
   try {
-    child = spawn(launch.cmd, launch.args, {
-      cwd:   launch.cwd,
-      env:   launch.env,
-      stdio: ['ignore', logFd, logFd],
-    });
+    child = spawn(cmd, args, { cwd: launch.cwd, env: launch.env, stdio });
   } catch (e) {
+    console.error(`[launch] ${identifier} failed to start:`, e.message);
     return { ok: false, error: e.message };
   } finally {
-    fs.closeSync(logFd);
+    if (logFd !== undefined) fs.closeSync(logFd);
   }
 
   const start = Date.now();
@@ -784,13 +861,85 @@ function startGame(identifier, exePath) {
     console.error(`[launch] ${identifier} failed to start:`, e.message);
     runningGames.delete(identifier);
   });
-  child.on('exit', (code) => {
+  child.on('exit', (code, signal) => {
     runningGames.delete(identifier);
     const secs = Math.round((Date.now() - start) / 1000);
     addPlaytime(identifier, secs);
-    console.log(`[launch] ${identifier} exited (code ${code}) after ${secs}s`);
+    console.log(`[launch] ${identifier} exited (code ${code}${signal ? `, signal ${signal}` : ''}) after ${secs}s`);
   });
-  return { ok: true, child, runnerName: launch.runnerName };
+  return { ok: true, child, start, logPath, inTerminal: !!settings.launchInTerminal, runnerName: launch.runnerName };
+}
+
+// Variables the runner added/changed and the ones it removed, relative to `base`.
+function diffEnv(base, env) {
+  const set   = {};
+  const unset = [];
+  for (const [k, v] of Object.entries(env)) if (base[k] !== v) set[k] = v;
+  for (const k of Object.keys(base)) if (!(k in env)) unset.push(k);
+  return { set, unset };
+}
+
+const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// A standalone bash script that reproduces the launch — it can also be edited
+// and re-run by hand from any terminal.
+function buildLaunchScript(identifier, launch, envDiff, logPath) {
+  const lines = [
+    '#!/usr/bin/env bash',
+    `# Generated by RohanKar Launcher on ${new Date().toISOString()}`,
+    `# Launches "${identifier}" via ${launch.runnerName}. Safe to edit and re-run by hand.`,
+    '',
+    ...envDiff.unset.map(k => `unset ${k}`),
+    ...Object.entries(envDiff.set).map(([k, v]) => `export ${k}=${shQuote(v)}`),
+    '',
+    `cd ${shQuote(launch.cwd)} || exit 1`,
+    `CMD=(${[launch.cmd, ...launch.args].map(shQuote).join(' ')})`,
+    `LOG=${shQuote(logPath)}`,
+    '',
+    'echo "+ cd $PWD"',
+    'echo "+ ${CMD[*]}"',
+    'echo',
+    'set -o pipefail',
+    '"${CMD[@]}" 2>&1 | tee -a "$LOG"',
+    'status=$?',
+    'echo',
+    'echo "[RohanKar] exited with code $status — log: $LOG"',
+    'if [ -t 0 ]; then read -r -p "Press Enter to close this window…" _; fi',
+    'exit $status',
+    '',
+  ];
+  return lines.join('\n');
+}
+
+// Returns [cmd, ...args] that opens a terminal running `bash <script>` and
+// (where the terminal supports it) stays in the foreground until it closes,
+// so playtime is still tracked.
+function findTerminal(script) {
+  const run = ['bash', script];
+  const candidates = [
+    ['konsole',        ['--nofork', '-e', ...run]],
+    ['gnome-terminal', ['--wait', '--', ...run]],
+    ['ptyxis',         ['--new-window', '-x', `bash ${shQuote(script)}`]],
+    ['kgx',            ['--', ...run]],
+    ['xfce4-terminal', ['--disable-server', '-x', ...run]],
+    ['kitty',          run],
+    ['alacritty',      ['-e', ...run]],
+    ['wezterm',        ['start', '--always-new-process', '--', ...run]],
+    ['foot',           run],
+    ['tilix',          ['-e', `bash ${shQuote(script)}`]],
+    ['xterm',          ['-e', ...run]],
+  ];
+  // $TERMINAL (if set) wins; unknown terminals get the common `-e` convention
+  const preferred = process.env.TERMINAL && runners.which(process.env.TERMINAL);
+  if (preferred) {
+    const known = candidates.find(([name]) => name === path.basename(preferred));
+    return [preferred, ...(known ? known[1] : ['-e', ...run])];
+  }
+  for (const [name, args] of candidates) {
+    const bin = runners.which(name);
+    if (bin) return [bin, ...args];
+  }
+  return null;
 }
 
 function runHeadlessLaunch(identifier, exeArg) {
@@ -817,6 +966,12 @@ ipcMain.handle('platform-info', () => {
     runners:         info.runners,
     umuAvailable:    info.umuAvailable,
   };
+});
+
+ipcMain.handle('open-log', (_, { identifier } = {}) => {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  const file = identifier ? path.join(LOG_DIR, `${sanitizeFolderName(identifier)}.log`) : null;
+  return shell.openPath(file && fs.existsSync(file) ? file : LOG_DIR);
 });
 
 // ─── Open game location in Explorer ──────────────────────────────────────────

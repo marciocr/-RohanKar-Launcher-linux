@@ -150,6 +150,8 @@ const btnChooseDownload       = document.getElementById('btn-choose-download');
 const btnChooseInstall        = document.getElementById('btn-choose-install');
 const runnerSelect            = document.getElementById('setting-runner');
 const useUmuCheck             = document.getElementById('setting-use-umu');
+const launchInTerminalCheck   = document.getElementById('setting-launch-in-terminal');
+const debugLoggingCheck       = document.getElementById('setting-debug-logging');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -465,7 +467,13 @@ async function init() {
   document.getElementById('btn-add-to-steam').addEventListener('click', onAddToSteam);
 
   // Linux runs games as child processes, so playtime is recorded when they exit
-  window.electronAPI.onGameExited(async ({ identifier }) => {
+  window.electronAPI.onGameExited(async ({ identifier, code, secs, early, logPath }) => {
+    if (early) {
+      const title = getTitle(allGames.find(g => g.identifier === identifier) || { identifier });
+      const open  = confirm(`${title} closed after ${secs}s (exit code ${code}) — it probably failed to start.\n\n` +
+        `Log: ${logPath}\n\nTip: try another Proton build in Settings, or enable "Launch games in a terminal" to watch the output.\n\nOpen the log now?`);
+      if (open) window.electronAPI.openLog({ identifier });
+    }
     library = await window.electronAPI.getLibrary();
     if (selectedGame?.identifier === identifier) {
       const secs = library[identifier]?.playtime_secs;
@@ -525,6 +533,7 @@ async function init() {
     if (p) installPathInput.value = p;
   });
   document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+  document.getElementById('btn-open-logs').addEventListener('click', () => window.electronAPI.openLog());
 
   // Scan for pre-existing installs
   document.getElementById('btn-scan-games').addEventListener('click', onScanForGames);
@@ -667,6 +676,8 @@ async function openSettings() {
   deleteAfterInstallCheck.checked   = !!s.deleteAfterInstall;
   installedFirstCheck.checked       = !!s.installedFirst;
   showInstalledBadgeCheck.checked   = s.showInstalledBadge !== false;
+  launchInTerminalCheck.checked     = !!s.launchInTerminal;
+  debugLoggingCheck.checked         = !!s.debugLogging;
   await populateRunnerSettings(s);
   settingsModal.classList.remove('hidden');
 }
@@ -684,6 +695,8 @@ async function saveSettings() {
     showInstalledBadge:  showInstalledBadgeCheck.checked,
     runner:              runnerSelect.value || 'auto',
     useUmu:              useUmuCheck.checked,
+    launchInTerminal:    launchInTerminalCheck.checked,
+    debugLogging:        debugLoggingCheck.checked,
   });
   installedFirst     = installedFirstCheck.checked;
   showInstalledBadge = showInstalledBadgeCheck.checked;

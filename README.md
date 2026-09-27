@@ -87,6 +87,12 @@ If [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) is insta
 - Game output (Proton/Wine logs) is written to `~/.config/RohanKar Launcher/logs/<game>.log`.
 - Playtime is tracked automatically while the game runs.
 
+#### Troubleshooting a game that won't start
+
+- If a game closes within a few seconds, the launcher says so and offers to open its log.
+- **Settings → Debug logging** (or start the launcher with `--debug`) logs every launcher step to `logs/launcher.log`. Game logs then also record the detected runners, working directory and environment variables, and Proton writes its own verbose `logs/steam-0.log` (`PROTON_LOG=1`).
+- **Settings → Launch games in a terminal** runs the game in a terminal window so you can watch the output live. The launcher uses `$TERMINAL` if set, otherwise Konsole, GNOME Terminal, Ptyxis, kitty, Alacritty, xterm and others. The exact command is saved as `logs/<game>.sh`, which you can edit and re-run by hand.
+
 ### Add to Steam / Steam Deck
 
 **Add to Steam** creates a Non-Steam shortcut that starts the launcher in headless mode (`--launch <game>`). The game then runs through the same Proton setup and prefix as when you launch it from the launcher. You don't need to force a compatibility tool in the shortcut's properties. Restart Steam for the shortcut to appear.

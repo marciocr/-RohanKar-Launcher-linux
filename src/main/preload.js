@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Launch
   launchGame:     (opts)  => ipcRenderer.invoke('launch-game',         opts),
   onGameExited:   (cb)    => ipcRenderer.on('game-exited', (_, data) => cb(data)),
+  openLog:        (opts)  => ipcRenderer.invoke('open-log',            opts),
   openGameLocation: (opts)=> ipcRenderer.invoke('open-game-location',  opts),
   readReadme:     (opts)  => ipcRenderer.invoke('read-readme',         opts),
 
